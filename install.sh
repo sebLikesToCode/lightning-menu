@@ -12,6 +12,7 @@ ln -sfn "$HERE/lm" ~/.local/bin/lm
 ln -sfn "$HERE/bin/whatbutton" ~/.local/bin/whatbutton
 ln -sfn "$HERE/systemd/ydotoold.service" \
         ~/.config/systemd/user/ydotoold.service
+ln -sfn "$HERE/systemd/lm.service" ~/.config/systemd/user/lm.service
 
 # Files, not the directory: a real directory with symlinked files inside is
 # the lower-risk shape for GNOME Shell's extension loader.
@@ -21,7 +22,7 @@ for f in extension.js metadata.json; do
 done
 
 systemctl --user daemon-reload
-systemctl --user enable --now ydotoold
+systemctl --user enable --now ydotoold lm
 
 echo "linked. still to do by hand:"
 echo

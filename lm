@@ -7,16 +7,52 @@ action you picked, with a Copy button - no second window.
 
 The window is undecorated, so the text at the top doubles as a drag handle.
 """
+import os
+import socket
+import sys
+
+# --------------------------------------------------------------- fast path
+#
+# Importing GTK costs about 90ms, and that was most of the delay between
+# pressing the key and seeing a window - paid again on every press. A
+# resident daemon keeps the toolkit warm; this client hands the request over
+# and exits before importing anything heavy, which costs about 10ms.
+#
+# Deliberately placed above the other imports: everything below this point
+# is skipped entirely on the fast path.
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+SOCKET = os.path.join(RUNTIME, "lm.sock")
+
+
+def poke_daemon():
+    """Ask a resident daemon to toggle the menu. True if one answered.
+
+    False for every failure - no daemon, stale socket, daemon wedged - and
+    the caller then runs the menu in this process as before.
+    """
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(0.5)
+            client.connect(SOCKET)
+            client.sendall(b"toggle\n")
+            return client.recv(8).startswith(b"ok")
+    except OSError:
+        return False
+
+
+if __name__ == "__main__" and "--daemon" not in sys.argv and poke_daemon():
+    sys.exit(0)
+
+# ------------------------------------------------- the rest needs the toolkit
 import ast
 import hashlib
 import html.entities as html_entities
 import json
 import operator
-import os
 import re
 import shutil
 import subprocess
-import sys
 import threading
 import time
 import unicodedata
@@ -166,6 +202,22 @@ def pointer_xy():
         return int(seen["X"]), int(seen["Y"])
     except (KeyError, ValueError):
         return None
+
+
+def current_selection():
+    """The highlighted text.
+
+    This spawns wl-paste, about 40ms, and that cannot be avoided here.
+    Two faster routes were tried and both are dead ends on GNOME:
+
+      - reading it in-process with GDK returns an empty string, because
+        Wayland gates clipboard access on having a focused surface and at
+        the moment the menu is summoned this process has no window;
+      - wl-paste --watch, which would push changes instead of being asked,
+        needs the wlroots data-control protocol, which Mutter does not
+        implement - the same wall that rules out fuzzel, wofi and rofi.
+    """
+    return selection()
 
 
 def clipboard_text():
@@ -2365,22 +2417,38 @@ _MONO_ACTIONS = {act_calc, act_bases, act_json, act_case, act_time,
 _CSS = b"""
 @define-color lm_accent #e5a50a;
 
+/* The desktop accent here is green (Yaru-mint), and the toolkit paints
+   every focus ring, entry outline and selected row with it. Redefining the
+   accent at application priority keeps this one window consistently yellow
+   without touching anything else in the session. */
+@define-color accent_color @lm_accent;
+@define-color accent_bg_color @lm_accent;
+@define-color accent_fg_color #1d1700;
+
 .lm-mono   { font-family: monospace; font-size: 0.95em; }
 .lm-text   { font-size: 1.0em; }
 .lm-head   { font-size: 0.9em; }
 
-.lm-panel {
-  border: 1px solid alpha(@lm_accent, 0.45);
-  border-top: 3px solid @lm_accent;
-}
+/* One bezel, the same on all four sides. */
+.lm-panel { border: 2px solid @lm_accent; }
 
-/* The bolt: a short mark down the left of whatever is focused. */
-.lm-list > row:hover      { background: alpha(@lm_accent, 0.12); }
-.lm-list > row:selected   { background: alpha(@lm_accent, 0.20); }
-.lm-list > row:selected   { box-shadow: inset 3px 0 0 0 @lm_accent; }
+.lm-list > row:hover          { background: alpha(@lm_accent, 0.12); }
+.lm-list > row:selected       { background: alpha(@lm_accent, 0.22); }
 .lm-list > row:selected label { font-weight: 600; }
 
-.lm-accent { color: @lm_accent; }
+/* Stated outright as well as via the accent, because a theme is free to
+   hard-code its own colour for these rather than read the accent. */
+*:focus-visible,
+button:focus-visible,
+entry:focus-visible,
+.lm-list > row:focus-visible  { outline-color: @lm_accent; }
+
+entry:focus-within,
+entry.search:focus-within     { outline-color: @lm_accent;
+                                border-color: @lm_accent; }
+
+dropdown button:focus-visible,
+dropdown:focus-within button  { outline-color: @lm_accent; }
 """
 
 
@@ -2862,8 +2930,20 @@ class Menu(Gtk.ApplicationWindow):
 
 
 class App(Gtk.Application):
-    def __init__(self):
+    # Longer than the keyboard's repeat delay (500ms by default), because a
+    # held key fires one press and then one every 30ms - 51 toggles over two
+    # seconds, which flickers the window open and shut. The guard resets on
+    # every request, accepted or not, so holding the button can never
+    # accumulate a second toggle however long it is held.
+    #
+    # The cost is that a deliberate second press inside this window is
+    # ignored too; Esc and clicking away still dismiss instantly.
+    REPEAT_GUARD = float(os.environ.get("LM_REPEAT_GUARD", "0.6"))
+
+    def __init__(self, resident=False):
         super().__init__(application_id="dev.sebastian.lm")
+        self.resident = resident
+        self._last_request = 0.0
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -2872,22 +2952,74 @@ class App(Gtk.Application):
         Gtk.StyleContext.add_provider_for_display(
             Gdk.Display.get_default(), css,
             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        if self.resident:
+            # Hold the application open with no window, so the toolkit stays
+            # loaded between presses. This is the whole point of the daemon.
+            self.hold()
+            threading.Thread(target=self._serve, daemon=True).start()
 
-    def do_activate(self):
+    def _serve(self):
+        """Accept toggle requests on a socket in the runtime directory."""
+        try:
+            os.unlink(SOCKET)
+        except OSError:
+            pass
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            server.bind(SOCKET)
+            os.chmod(SOCKET, 0o600)
+            server.listen(8)
+        except OSError as err:
+            note(f"daemon could not listen on {SOCKET}: {err}")
+            return
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                try:
+                    conn.recv(64)
+                    # Always acknowledge, even when the request is swallowed
+                    # as auto-repeat: the client only needs to know a daemon
+                    # answered, and must not fall back to starting its own.
+                    if self.accept_request():
+                        # The toolkit is not thread-safe; hop to the loop.
+                        GLib.idle_add(self.toggle)
+                    conn.sendall(b"ok\n")
+                except OSError:
+                    pass
+
+    def accept_request(self):
+        """True for a real press, False for keyboard auto-repeat.
+
+        Thread-safe enough for this: the listener thread is the only caller,
+        and a stale read would at worst let one extra toggle through.
+        """
+        now = time.monotonic()
+        gap = now - self._last_request
+        self._last_request = now      # reset even when refusing
+        return gap >= self.REPEAT_GUARD
+
+    def toggle(self):
         """Open the menu, or dismiss it if it is already up.
 
-        Every press launches a fresh process; GtkApplication turns that into
-        a toggle for free, because a second process with the same
-        application_id hands its activation to the running one and exits.
-        Closing the last window quits, so the next press re-reads the
-        selection - which is what you want, it has probably changed.
+        The selection is read fresh each time, because it has almost
+        certainly changed since the last press.
         """
         if self.get_windows():
-            for w in list(self.get_windows()):
-                w.close()
-            return
-        Menu(self, selection()).present()
+            for window in list(self.get_windows()):
+                window.close()
+            return False
+        Menu(self, current_selection()).present()
+        return False
+
+    def do_activate(self):
+        # In resident mode the initial activation must not open anything;
+        # the window appears only when a client asks for it.
+        if not self.resident:
+            self.toggle()
 
 
 if __name__ == "__main__":
-    sys.exit(App().run([]))
+    sys.exit(App(resident="--daemon" in sys.argv).run([]))

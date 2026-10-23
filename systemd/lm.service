@@ -1,0 +1,15 @@
+[Unit]
+Description=Lightning Menu daemon (keeps GTK loaded so the menu opens instantly)
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# X11 only so the fallback window placement works; once the qmplace shell
+# extension is loaded this can be dropped and the daemon run natively.
+Environment=GDK_BACKEND=x11
+ExecStart=%h/.local/bin/lm --daemon
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
