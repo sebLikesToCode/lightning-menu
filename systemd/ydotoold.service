@@ -1,0 +1,13 @@
+[Unit]
+Description=ydotoold (user) - input synthesis for qm's "Replace selection"
+
+[Service]
+# Runs as the user, not root: logind puts an ACL on /dev/uinput for the
+# active session, so no privileged daemon is needed. Socket goes in the
+# runtime dir instead of ydotoold's root-oriented /tmp default.
+ExecStart=/usr/bin/ydotoold --socket-path=%t/.ydotool_socket --socket-perm=0600
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

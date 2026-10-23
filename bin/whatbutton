@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Print what each mouse button actually sends. Run with sudo.
+
+Reads the raw evdev stream from every endpoint the mouse's receiver
+registers, because a programmable mouse sends some buttons as mouse buttons
+and others as keystrokes, from different endpoints. Watching only the
+"mouse" node would miss exactly the buttons we care about.
+
+No dependencies - struct-unpacks input_event directly.
+"""
+import glob
+import os
+import select
+import struct
+import sys
+import time
+
+# struct input_event: timeval (2x long) + type u16 + code u16 + value s32
+FMT = "llHHi"
+SZ = struct.calcsize(FMT)
+EV_KEY = 0x01
+
+BTN = {
+    272: "LEFT click", 273: "RIGHT click", 274: "MIDDLE click",
+    275: "SIDE (btn 8)", 276: "EXTRA (btn 9)", 277: "FORWARD (btn 10)",
+    278: "BACK (btn 11)", 279: "TASK", 280: "BTN_0", 281: "BTN_1",
+}
+KEY = {
+    1: "ESC", 14: "BACKSPACE", 15: "TAB", 28: "ENTER", 29: "LEFT CTRL",
+    42: "LEFT SHIFT", 54: "RIGHT SHIFT", 56: "LEFT ALT", 57: "SPACE",
+    97: "RIGHT CTRL", 100: "RIGHT ALT", 125: "LEFT SUPER (Windows key)",
+    126: "RIGHT SUPER", 127: "MENU",
+    **{59 + i: f"F{i+1}" for i in range(10)}, 87: "F11", 88: "F12",
+    **{dict(zip("1234567890", range(2, 12)))[c]: c for c in "1234567890"},
+    **{k: v for v, k in zip(
+        "qwertyuiop", range(16, 26))},
+    **{k: v for v, k in zip("asdfghjkl", range(30, 39))},
+    **{k: v for v, k in zip("zxcvbnm", range(44, 51))},
+}
+
+
+def name(code):
+    if code in BTN:
+        return BTN[code]
+    if code in KEY:
+        return f"key '{KEY[code]}'"
+    return f"code {code}"
+
+
+def devices():
+    """Event nodes belonging to the mouse receiver, by name."""
+    found, cur = [], None
+    try:
+        for line in open("/proc/bus/input/devices"):
+            if line.startswith("N: Name="):
+                cur = line.split("=", 1)[1].strip().strip('"')
+            elif line.startswith("H: Handlers=") and cur:
+                if any(w in cur.lower() for w in
+                       ("compx", "redragon", "mouse", "receiver")):
+                    for h in line.split("=", 1)[1].split():
+                        if h.startswith("event"):
+                            found.append((f"/dev/input/{h}", cur))
+    except OSError as e:
+        sys.exit(f"cannot read /proc/bus/input/devices: {e}")
+    return found
+
+
+def main():
+    devs = devices()
+    if not devs:
+        sys.exit("no mouse-like input devices found")
+
+    fds = {}
+    for path, label in devs:
+        try:
+            fds[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = (path, label)
+        except PermissionError:
+            sys.exit(f"need root to read {path}\n\nRun:  sudo {sys.argv[0]}")
+        except OSError:
+            pass
+
+    print("Watching:", ", ".join(sorted({p for p, _ in fds.values()})))
+    print()
+    print("Press each mouse button once - side buttons, back, forward,")
+    print("wheel click, anything extra. Ctrl+C when done.")
+    print("-" * 62)
+
+    deadline = time.time() + 120
+    try:
+        while time.time() < deadline:
+            r, _, _ = select.select(list(fds), [], [], 1.0)
+            for fd in r:
+                try:
+                    data = os.read(fd, SZ * 64)
+                except OSError:
+                    continue
+                for i in range(0, len(data) - SZ + 1, SZ):
+                    _, _, etype, code, value = struct.unpack(
+                        FMT, data[i:i + SZ])
+                    if etype == EV_KEY and value == 1:   # press only
+                        path, _lbl = fds[fd]
+                        print(f"  {name(code):<28} "
+                              f"[{os.path.basename(path)}, code {code}]")
+    except KeyboardInterrupt:
+        pass
+    finally:
+        print("-" * 62)
+        print("Done. Paste the list above back to Claude.")
+        for fd in fds:
+            os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

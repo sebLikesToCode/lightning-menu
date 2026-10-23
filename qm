@@ -1,0 +1,2875 @@
+#!/usr/bin/env python3
+"""qm - a popup menu that acts on whatever text is currently highlighted.
+
+Bound to a key or a remapped mouse button. Press to open, press again (or
+click elsewhere, or Esc) to dismiss. Results appear inline underneath the
+action you picked, with a Copy button - no second window.
+
+The window is undecorated, so the text at the top doubles as a drag handle.
+"""
+import ast
+import hashlib
+import html.entities as html_entities
+import json
+import operator
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import unicodedata
+import zlib
+from datetime import datetime, timezone as utc_tz
+from zoneinfo import ZoneInfo
+import urllib.parse
+
+import gi
+gi.require_version("Gtk", "4.0")
+gi.require_version("Pango", "1.0")
+from gi.repository import Gtk, Gdk, Gio, GLib, Pango  # noqa: E402
+
+TRANS = shutil.which("trans")
+YDOTOOL = shutil.which("ydotool")
+XDOTOOL = shutil.which("xdotool")
+# Distinctive, so xdotool can find this window and nothing else. Never seen:
+# the window is undecorated.
+QM_TITLE = "qm-selection-menu"
+# evdev keycodes - what ydotool speaks. KEY_LEFTCTRL / KEY_V.
+_K_CTRL, _K_V, _K_A, _K_INS = 29, 47, 30, 110
+# ydotoold runs as this user (logind grants an ACL on /dev/uinput), so its
+# socket lives in the runtime dir rather than the root default under /tmp.
+YDOTOOL_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000"), ".ydotool_socket")
+MAX_INPUT = 4000        # a selection longer than this is not a sum
+
+
+# ----------------------------------------------------------------- selection
+def selection():
+    """The PRIMARY selection - whatever is highlighted right now.
+
+    Falls back to the clipboard so the menu stays useful when nothing is
+    highlighted but something was copied.
+    """
+    for args in (["wl-paste", "--primary", "-n"], ["wl-paste", "-n"]):
+        try:
+            r = subprocess.run(args, capture_output=True, text=True, timeout=3)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return ""
+
+
+LOG = os.path.join(os.environ.get(
+    "XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "qm.log")
+
+
+def note(line):
+    """One line per launch about window placement, for when it misbehaves.
+
+    Placement depends on things no error message would reveal - which GDK
+    backend we got, whether xdotool can see the window - so each attempt
+    records what it found.
+    """
+    try:
+        with open(LOG, "a") as fh:
+            fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {line}\n")
+    except OSError:
+        pass
+
+
+def _on_x11():
+    """True when we are an X11 client (i.e. running under XWayland)."""
+    try:
+        # The class is "X11Display" here, not "GdkX11Display" - checking for
+        # the prefix silently never matched, so the window never moved.
+        return "X11" in type(Gdk.Display.get_default()).__name__
+    except Exception:
+        return False
+
+
+PLACE_FILE = os.path.join(os.environ.get(
+    "XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "qm-place")
+
+
+def shell_place_at_pointer(title, gap=14):
+    """Ask the qmplace shell extension to put this window at the pointer.
+
+    The compositor is the only place where this is possible at all: a client
+    may not position its own surface on Wayland, and cannot learn where the
+    pointer is outside its own windows. Inside the shell both are ordinary -
+    global.get_pointer() is the live position and Mutter can move any
+    window. So the extension does the whole job and we just ask.
+
+    True when placed; False when the extension answered but could not find
+    the window yet (so retrying is worth it); None when the extension is not
+    loaded at all, which is the case until the next login after installing
+    it (so retrying is not).
+    """
+    try:
+        bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        placed, = bus.call_sync(
+            "org.gnome.Shell", "/org/gnome/Shell/Extensions/QmPlace",
+            "org.gnome.Shell.Extensions.QmPlace", "PlaceAtPointer",
+            GLib.Variant("(si)", (title, gap)),
+            GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, 2000,
+            None).unpack()
+        return bool(placed)
+    except GLib.Error:
+        return None        # not loaded at all, as opposed to "not yet"
+
+
+def saved_place():
+    """Where this window was last dragged to, or None."""
+    try:
+        with open(PLACE_FILE) as fh:
+            x, y = fh.read().split()
+            return int(x), int(y)
+    except (OSError, ValueError):
+        return None
+
+
+def remember_place(x, y):
+    try:
+        with open(PLACE_FILE, "w") as fh:
+            fh.write(f"{x} {y}")
+    except OSError:
+        pass
+
+
+def pointer_xy():
+    """DO NOT USE for placement - the answer is stale.
+
+    Kept only as a record of why. On native Wayland no client can ask where
+    the pointer is outside its own surfaces. XWayland does answer, but only
+    with the last position an X11 client saw: with Wayland-native apps under
+    the pointer it never updates, and returns the same coordinates for
+    hours. Placing a window there puts it in a fixed arbitrary spot.
+    """
+    if not XDOTOOL:
+        return None
+    try:
+        got = subprocess.run([XDOTOOL, "getmouselocation", "--shell"],
+                             capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if got.returncode != 0:
+        return None
+    seen = {}
+    for line in got.stdout.splitlines():
+        if "=" in line:
+            key, value = line.split("=", 1)
+            seen[key] = value
+    try:
+        return int(seen["X"]), int(seen["Y"])
+    except (KeyError, ValueError):
+        return None
+
+
+def clipboard_text():
+    """The clipboard only, never the primary selection."""
+    try:
+        got = subprocess.run(["wl-paste", "-n"], capture_output=True,
+                             text=True, timeout=3)
+        if got.returncode == 0:
+            return got.stdout
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return ""
+
+
+def copy(text):
+    try:
+        subprocess.run(["wl-copy"], input=text, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def set_clipboard(text):
+    """Set the clipboard from inside this process.
+
+    Deliberately NOT wl-copy. On GNOME a client has to own a focused surface
+    to take the clipboard, so wl-copy briefly steals focus - and this menu
+    dismisses itself on focus loss, so the answer was being thrown away the
+    instant it appeared. Measured both ways: with the wl-copy call the window
+    dies on click, without it the window survives.
+    """
+    try:
+        Gdk.Display.get_default().get_clipboard().set(text)
+    except Exception:
+        pass
+
+
+def notify(body, summary="qm"):
+    try:
+        subprocess.Popen(["notify-send", "-a", "qm", summary, body])
+    except OSError:
+        pass
+
+
+# SGR escape codes. A GtkLabel has no idea what these mean and renders them
+# as stray characters, so nothing that reaches the UI may contain them.
+_ANSI = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
+def run_out(args):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        return "(timed out)"
+    except OSError as e:
+        return f"(could not run {args[0]}: {e})"
+    text = (r.stdout or "").strip() or (r.stderr or "").strip()
+    return _ANSI.sub("", text) or "(no output)"
+
+
+# ==================================================================== maths
+#
+# Text copied off a worksheet or a website is full of typography that no
+# parser accepts: real x and ÷ signs, superscript exponents, a U+2212 minus
+# that merely looks like a hyphen, vulgar fractions, thousands separators.
+# Everything below rewrites that into ordinary ASCII before parsing.
+
+_SUP_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹"
+_SUP_OTHER = "⁺⁻⁼⁽⁾ⁿⁱ"
+_SUP_MAP = str.maketrans(_SUP_DIGITS + _SUP_OTHER, "0123456789+-=()ni")
+_SUP_RUN = re.compile(f"[{_SUP_DIGITS}{_SUP_OTHER}]+")
+
+_SUB_MAP = str.maketrans(
+    "₀₁₂₃₄₅₆₇₈₉",
+    "0123456789")
+_SUB_RUN = re.compile("[₀-₉]+")
+
+_VULGAR = {
+    "½": "(1/2)", "⅓": "(1/3)", "⅔": "(2/3)",
+    "¼": "(1/4)", "¾": "(3/4)", "⅕": "(1/5)",
+    "⅖": "(2/5)", "⅗": "(3/5)", "⅘": "(4/5)",
+    "⅙": "(1/6)", "⅚": "(5/6)", "⅐": "(1/7)",
+    "⅛": "(1/8)", "⅜": "(3/8)", "⅝": "(5/8)",
+    "⅞": "(7/8)", "⅑": "(1/9)", "⅒": "(1/10)",
+}
+
+_SYMBOL = {
+    "×": "*", "⋅": "*", "·": "*", "∗": "*",
+    "✕": "*", "✖": "*", "⁢": "*",
+    "÷": "/", "∕": "/", "⁄": "/", "／": "/", "∶": "/",
+    "−": "-", "–": "-", "—": "-", "‐": "-", "‑": "-",
+    "＋": "+", "﹢": "+",
+    "π": "pi", "ℯ": "E", "∞": "oo", "∂": "d",
+    "°": "*pi/180", "º": "*pi/180",     # so trig on degrees works
+    "≤": "<=", "≥": ">=", "≠": "!=",
+    "≈": "=", "≡": "=", "＝": "=",
+    "‘": "", "’": "", "“": "", "”": "",
+    " ": " ", " ": " ", " ": " ", "​": "",
+    "（": "(", "）": ")", "[": "(", "]": ")", "{": "(", "}": ")",
+}
+
+# A root sign binds to the token after it, so it needs explicit brackets:
+# "sqrt9" would otherwise parse as sqrt*9 once implicit multiplication is on.
+_ROOT_INDEX = {"√": 2, "∛": 3, "∜": 4}
+_ROOT = re.compile(r"([√∛∜])\s*"
+                   r"(\d+(?:\.\d+)?|[A-Za-z]\w*|\([^()]*\))")
+
+# Thousands separators, but only between digit groups - never a comma that
+# is separating arguments.
+_FLOOR = re.compile(r"⌊([^⌊⌋]*)⌋")
+_CEIL = re.compile(r"⌈([^⌈⌉]*)⌉")
+_ABS_BARS = re.compile(r"\|([^|]+)\|")
+# Digits only, and never a bare "C": "0 C to K" is a temperature, not a
+# binomial coefficient.
+_CHOOSE = re.compile(r"\b(\d+)\s*(?:choose|nCr)\s*(\d+)\b", re.I)
+_THOUSANDS = re.compile(r"(?<=\d),(?=\d{3}(?!\d))")
+
+# "800 x 222" is multiplication; "2x + 1" and "x + 1" are the variable x.
+# The difference is whether a NUMBER sits on both sides, so that is the test.
+_X_AS_TIMES = re.compile(r"(?<=[\d)])\s*[xX✕]\s*(?=[\d(])")
+
+_PERCENT_OF = re.compile(r"(\d+(?:\.\d+)?)\s*%\s*of\s+", re.I)
+_TRAILING_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+
+# ∫ x² dx, ∫_0^1 x² dx, d/dx x², ∂/∂x, ∑_(n=1)^10 n² - the symbols people
+# actually write, rewritten into the calls sympy understands.
+_LIMITS_WORDS = re.compile(r"\bfrom\s+(\S+)\s+to\s+(\S+)\s*$", re.I)
+_INTEGRAL = re.compile(
+    r"∫\s*(?:_\s*\{?([^\s^{}]+)\}?\s*\^\s*\{?([^\s{}]+)\}?\s*)?"
+    r"(.+?)\s*d\s*([A-Za-z]\w*)\s*$", re.S)
+_DERIVATIVE = re.compile(r"\bd\s*/\s*d\s*([A-Za-z]\w*)\s*(.+)$", re.S)
+_LIMIT = re.compile(
+    r"\blim\s*_?\s*\(?\s*([A-Za-z]\w*)\s*(?:→|->|to)\s*([^\s)]+)\s*\)?\s*"
+    r"(.+)$", re.S | re.I)
+_PRODUCT = re.compile(
+    r"∏\s*_?\s*\(?\s*([A-Za-z]\w*)\s*=\s*([^\s)^]+)\s*\)?\s*"
+    r"\^\s*\(?\s*([^\s)]+)\s*\)?\s*(.+)$", re.S)
+_SUMMATION = re.compile(
+    r"[∑Σ]\s*_?\s*\(?\s*([A-Za-z]\w*)\s*=\s*([^\s)^]+)\s*\)?\s*"
+    r"\^\s*\(?\s*([^\s)]+)\s*\)?\s*(.+)$", re.S)
+
+
+def _calculus(text):
+    """Rewrite calculus notation as integrate() / diff() / summation()."""
+    body = text
+    worded = None
+    found = _LIMITS_WORDS.search(body)
+    if found:
+        worded = (found.group(1), found.group(2))
+        body = body[:found.start()].rstrip()
+
+    hit = _INTEGRAL.search(body)
+    if hit:
+        lower, upper, inner, var = hit.groups()
+        if worded and not lower:
+            lower, upper = worded
+        inner = inner.strip() or "1"
+        if lower and upper:
+            tail = f"integrate({inner}, ({var}, {lower}, {upper}))"
+        else:
+            tail = f"integrate({inner}, {var})"
+        return body[:hit.start()] + tail
+
+    hit = _LIMIT.search(body)
+    if hit:
+        var, point, inner = hit.groups()
+        return body[:hit.start()] + f"limit({inner.strip()}, {var}, {point})"
+
+    hit = _PRODUCT.search(body)
+    if hit:
+        var, low, high, inner = hit.groups()
+        return (body[:hit.start()]
+                + f"product({inner.strip()}, ({var}, {low}, {high}))")
+
+    hit = _SUMMATION.search(body)
+    if hit:
+        var, low, high, inner = hit.groups()
+        return (body[:hit.start()]
+                + f"summation({inner.strip()}, ({var}, {low}, {high}))")
+
+    hit = _DERIVATIVE.search(body)
+    if hit:
+        var, inner = hit.groups()
+        return body[:hit.start()] + f"diff({inner.strip()}, {var})"
+
+    return text
+
+
+def normalise_maths(src):
+    """Rewrite typographic maths into something a parser accepts."""
+    s = src.strip()
+
+    for k, v in _VULGAR.items():
+        s = s.replace(k, v)
+
+    # Do not add brackets the input already has: "√(-9)" would otherwise
+    # become sqrt((-9)) and echo back with doubled parentheses.
+    # Reading ∛ as √ gave 2.83 for the cube root of 8 - a wrong answer with
+    # no warning at all, which is the worst way for this to fail.
+    def _root(found):
+        index = _ROOT_INDEX[found.group(1)]
+        arg = found.group(2)
+        if not arg.startswith("("):
+            arg = "(" + arg + ")"
+        return f"sqrt{arg}" if index == 2 else f"root{arg[:-1]}, {index})"
+    s = _ROOT.sub(_root, s)
+    s = _SUP_RUN.sub(lambda m: "**(" + m.group(0).translate(_SUP_MAP) + ")", s)
+    # x₁ must become x_1, not x1: the parser reads a trailing digit as
+    # multiplication, so "x₁ + x₂" was collapsing to 3*x.
+    s = _SUB_RUN.sub(lambda m: "_" + m.group(0).translate(_SUB_MAP), s)
+
+    for k, v in _SYMBOL.items():
+        s = s.replace(k, v)
+
+    s = _FLOOR.sub(r"floor(\1)", s)
+    s = _CEIL.sub(r"ceiling(\1)", s)
+    s = _ABS_BARS.sub(r"Abs(\1)", s)
+    s = _CHOOSE.sub(r"binomial(\1, \2)", s)
+    s = _THOUSANDS.sub("", s)
+    s = _PERCENT_OF.sub(r"(\1/100)*", s)
+    s = _TRAILING_PCT.sub(r"(\1/100)", s)
+    s = _X_AS_TIMES.sub("*", s)
+    s = s.rstrip("=").strip()
+    s = re.sub(r"\s+", " ", s)
+    # Last, so the integrand is already plain ASCII by this point.
+    return _calculus(s)
+
+
+# ------------------------------------------------- output, in real notation
+#
+# normalise_maths() goes the other way: typography in, ASCII out, so a parser
+# can read it. This turns the parser's output back into notation a person
+# reads - superscript powers, implicit multiplication, real signs, and a
+# horizontal bar for fractions.
+
+_SUPER_OUT = str.maketrans("0123456789-+()",
+                           "⁰¹²³⁴⁵"
+                           "⁶⁷⁸⁹"
+                           "⁻⁺⁽⁾")
+
+_BAR = "─"          # the box-drawing rule sympy uses for fraction bars
+# Pictures worth keeping in two dimensions: a fraction bar, or the bracket
+# pieces sympy builds matrices out of.
+_KEEP_2D = (_BAR, "⎡", "⎣", "⎢", "⎤", "⎦", "⎥")
+
+
+def prettify_maths(text):
+    """8*x**2 - 8*x*y  ->  8x² − 8xy  (single line)"""
+    out = text
+
+    # Integer powers become superscripts; anything else falls back to ^,
+    # since there are no superscript glyphs for arbitrary expressions.
+    out = re.sub(r"\*\*\(?(-?\d+)\)?",
+                 lambda m: m.group(1).translate(_SUPER_OUT), out)
+    out = re.sub(r"\^\(?(-?\d+)\)?",
+                 lambda m: m.group(1).translate(_SUPER_OUT), out)
+    out = out.replace("**", "^")
+
+    out = re.sub(r"\bsqrt\((\d+(?:\.\d+)?)\)(?!\s*\*)",
+                 lambda m: "√" + m.group(1), out)
+    out = out.replace("sqrt(", "√(")
+    out = re.sub(r"\bpi\b", "π", out)
+    out = re.sub(r"\boo\b", "∞", out)
+    # sympy writes the imaginary unit as I. Nobody reads it that way, and a
+    # variable named I is impossible anyway - the parser claims that letter.
+    out = re.sub(r"\bI\b", "i", out)
+
+    # Tighten the spacing first, so "8 * x" and "8*x" are handled alike and
+    # removing the sign cannot leave a double space behind.
+    out = re.sub(r"[ \t]*\*[ \t]*", "*", out)
+    out = re.sub(r"(?<=\d)\*(?=\d)", " × ", out)
+    out = re.sub(r"(?<=[\d)])\*(?=\()", " × ", out)
+    out = re.sub(r"(?<=\))\*(?=\w)", " × ", out)
+    # A name beside a number needs the sign too: "π2" would not read as
+    # a product, while "8x" does.
+    out = re.sub(r"(?<=[^\W\d_])\*(?=[\d(])", " × ", out)
+    out = out.replace("*", "")
+
+    out = re.sub(r"[ \t]*/[ \t]*", " ÷ ", out)
+    out = out.replace(">=", "≥").replace("<=", "≤")
+    out = out.replace("!=", "≠")
+
+    # A real minus sign, not a hyphen. Safe wholesale: by this point every
+    # hyphen left in the string is arithmetic.
+    return out.replace("-", "−")
+
+
+def _exact_enough(value):
+    """True when a decimal approximation would add nothing.
+
+    An integer or a Gaussian integer - 3, -i, 2+3i - already reads exactly,
+    and "≈ -1.0i" printed beside "-i" is noise. Fractions and radicals do
+    benefit from one.
+    """
+    try:
+        real, imag = value.as_real_imag()
+    except Exception:
+        return False
+    return bool(real.is_Integer and imag.is_Integer)
+
+
+def _printer():
+    from sympy.printing.pretty.pretty import PrettyPrinter
+    return PrettyPrinter({"use_unicode": True, "wrap_line": False})
+
+
+def _block(obj, pp):
+    """(lines, baseline) for a sympy expression or an already-pretty string.
+
+    Expressions that contain a real fraction keep sympy's two-dimensional
+    layout, so the bar is drawn horizontally with numerator above and
+    denominator below. Everything else collapses to one line, because
+    stacking a whole expression to show "x squared" would be worse than
+    writing x².
+
+    Only same-width substitutions are allowed on the 2-D art: changing any
+    line's length would break the column alignment that holds the stack
+    together.
+    """
+    if isinstance(obj, str):
+        return ([obj], 0)
+    # sympy prints small rationals inline ("5/2") and only stacks big ones.
+    # A fraction is precisely where a bar belongs, so draw it either way.
+    if getattr(obj, "is_Rational", False) and not obj.is_Integer:
+        num, den = str(abs(obj.p)), str(obj.q)
+        width = max(len(num), len(den))
+        rows = [num.center(width), _BAR * width, den.center(width)]
+        if obj.p < 0:
+            rows = [" " + rows[0], "\u2212" + rows[1], " " + rows[2]]
+        return (rows, 1)
+    try:
+        form = pp._print(obj)
+        pic = [str(ln) for ln in form.picture]
+    except Exception:
+        return ([prettify_maths(str(obj))], 0)
+    if any(any(mark in ln for mark in _KEEP_2D) for ln in pic):
+        return ([re.sub(r"\bI\b", "i", ln).replace("-", "−")
+                 for ln in pic], form.baseline)
+    return ([prettify_maths(str(obj))], 0)
+
+
+def _layout(items, pp):
+    """Stack steps with the = signs in one column, on each step's baseline.
+
+    A multi-line step puts its = beside the fraction bar rather than beside
+    the numerator, which is where the eye expects it.
+    """
+    blocks, last = [], None
+    for it in items:
+        lines, base = _block(it, pp)
+        key = "\n".join(lines)
+        if key == last or not key.strip():
+            continue
+        last = key
+        blocks.append((lines, base))
+
+    out = []
+    for i, (lines, base) in enumerate(blocks):
+        lead = "  " if i == 0 else "= "
+        for j, ln in enumerate(lines):
+            out.append(((lead if j == base else "  ") + ln).rstrip())
+    return "\n".join(out)
+
+
+def _labelled(label, obj, pp):
+    """A label with a possibly-stacked value under it."""
+    lines, base = _block(obj, pp)
+    if len(lines) == 1:
+        return [f"{label} {lines[0].strip()}"]
+    pad = " " * (len(label) + 1)
+    return [((label + " ") if i == base else pad) + ln.rstrip()
+            for i, ln in enumerate(lines)]
+
+
+def _fmt(val):
+    """Trim sympy's zero padding: 24.0000000000 -> 24, 0.500000 -> 0.5."""
+    t = str(val)
+    if "." in t and "e" not in t.lower() and "E" not in t:
+        t = t.rstrip("0").rstrip(".")
+    return t or "0"
+
+
+# A trailing clause can supply values for the variables:
+#   "8x^2 + (-8xy) with x = -1 and y = 900"
+#   "3a + 2b, a=4, b=5"
+# Selections copied off a worksheet carry an instruction with them:
+#   "1. solve a + b + c"    "find x: 2x + 4 = 10"    "simplify 3a + 2a"
+# None of that is maths, and the parser choked on every one of them.
+_LIST_PREFIX = re.compile(
+    r"^\s*(?:(?:q|question|ex|exercise|problem|part|no|number)\s*)?"
+    r"(?:\(?[0-9]{1,3}\)?[.):]\s*|\(?[a-z]\)?[.)]\s*)+", re.I)
+_VERBS = (r"solve|find|evaluate|simplify|expand|factor|factorise|factorize|"
+          r"calculate|compute|determine|work\s+out|what\s+is|whats")
+# "find the value of x:", "solve for y", "work out the answer:" - the
+# filler between the verb and the maths varies, so allow for it.
+_VERB_HEAD = re.compile(
+    r"^\s*(?:" + _VERBS + r")\b"
+    r"(?:\s+(?:the\s+)?(?:value|values|root|roots|solution|solutions|"
+    r"answer|result)s?)?"
+    r"(?:\s+(?:of|to))?"
+    r"(?:\s+for\s+([A-Za-z]\w*))?"
+    r"\s*[:,]?\s*", re.I)
+_TARGET_COLON = re.compile(r"^\s*([A-Za-z]\w*)\s*:\s*")
+
+
+def strip_header(text):
+    """Strip any instruction wrapper. Returns (maths, the named unknown).
+
+    A word counts as the unknown only when it is explicit - after "for", or
+    followed by a colon. Otherwise "solve a + b + c" would lose its a.
+    """
+    body = _LIST_PREFIX.sub("", text, count=1)
+    # A list marker must not swallow a real term. "(3) × (4)" looks exactly
+    # like the "(a)" of a numbered question, and stripping it left "× (4)" -
+    # which starts with an operator, and that is the giveaway.
+    if body.strip()[:1] in {"+", "-", "*", "/", "^", "×", "÷", "·", "−", ")"}:
+        body = text
+    target = None
+    head = _VERB_HEAD.match(body)
+    if head:
+        target = head.group(1)
+        body = body[head.end():]
+    if target is None:
+        named = _TARGET_COLON.match(body)
+        if named and body[named.end():].strip():
+            target, body = named.group(1), body[named.end():]
+    return body.strip(), target
+
+
+def split_equations(norm):
+    """Several equations in one selection: "2x + y = 7, x - y = 2"."""
+    chunks = [c.strip() for c in re.split(r"[;,]|\band\b", norm, flags=re.I)]
+    chunks = [c for c in chunks if c]
+    if len(chunks) >= 2 and all(c.count("=") == 1 for c in chunks):
+        return chunks
+    return None
+
+
+_SUBS_KEYWORD = re.compile(r"\b(?:with|where|given|when|for|at)\b", re.I)
+_ASSIGN_TAIL = re.compile(r"\s*[A-Za-z]\w*\s*=[^=].*", re.S)
+
+
+def split_subs(src):
+    """Separate 'expression' from 'values for its variables'."""
+    m = _SUBS_KEYWORD.search(src)
+    if m:
+        return src[:m.start()], src[m.end():]
+    # No keyword: peel assignments off the end. Thousands separators are
+    # safe here, because "250" does not match name=value.
+    parts = src.split(",")
+    tail = []
+    while len(parts) > 1 and _ASSIGN_TAIL.fullmatch(parts[-1]):
+        tail.insert(0, parts.pop())
+    # Only if the remainder is an expression. "x + y + z = 6, x - y = 0,
+    # z = 2" is three equations, not an expression with z supplied, and
+    # peeling the last one off left unparseable wreckage.
+    if tail and "=" not in ",".join(parts):
+        return ",".join(parts), ",".join(tail)
+    return src, ""
+
+
+def parse_subs(clause):
+    """{'x': '-1', 'y': '900'} from 'x = -1 and y = 900'."""
+    out = {}
+    for part in re.split(r",|;|\band\b", clause, flags=re.I):
+        name, _, val = part.strip().partition("=")
+        name, val = name.strip(), val.strip()
+        if val and re.fullmatch(r"[A-Za-z]\w*", name):
+            out[name] = val
+    return out
+
+
+# ---- engine 1: sympy, when it is installed. Variables, exact fractions,
+# ---- solving, substitution, simplification.
+def _sympy_calc(norm, subs_raw="", target=None):
+    import sympy
+    from sympy.parsing.sympy_parser import (
+        parse_expr, standard_transformations,
+        implicit_multiplication_application, convert_xor)
+
+    tr = standard_transformations + (
+        implicit_multiplication_application, convert_xor)
+    pp = _printer()
+
+    def parse(t, evaluate=True):
+        return parse_expr(t, transformations=tr, evaluate=evaluate)
+
+    subs_txt = parse_subs(subs_raw) if subs_raw else {}
+
+    # ---- values supplied: simplify, plug in, show the working
+    if subs_txt:
+        expr = parse(norm)
+        simple = sympy.expand(expr)
+        env = {sympy.Symbol(k): parse(normalise_maths(v))
+               for k, v in subs_txt.items()}
+
+        steps = [expr, simple]
+
+        # The "plug in" line is textual on purpose: substituting for real
+        # evaluates immediately, so there would be nothing left to show.
+        plugged = str(simple)
+        for name, val in subs_txt.items():
+            plugged = re.sub(rf"\b{re.escape(name)}\b", f"({val})", plugged)
+        steps.append(prettify_maths(plugged))
+
+        # One intermediate line: each top-level term worked out on its own.
+        # Substituting into the whole Add would collapse straight to the
+        # answer, so each arg is substituted separately.
+        if simple.is_Add and len(simple.args) > 1:
+            bits = []
+            for arg in simple.args:
+                v = arg.subs(env, simultaneous=True)
+                t = _fmt(v) if not getattr(v, "is_Integer", False) else str(v)
+                if not bits:
+                    bits.append(t)
+                elif t.startswith("-"):
+                    bits.append("- " + t[1:])
+                else:
+                    bits.append("+ " + t)
+            steps.append(prettify_maths(" ".join(bits)))
+
+        final = sympy.expand(simple.subs(env, simultaneous=True))
+        if final.free_symbols or getattr(final, "is_Integer", False):
+            steps.append(final)
+        else:
+            steps.append(prettify_maths(_fmt(sympy.N(final, 12))))
+
+        given = ",   ".join(f"{k} = {prettify_maths(v)}"
+                            for k, v in subs_txt.items())
+        out = [given, "", _layout(steps, pp)]
+        if not final.free_symbols and not getattr(final, "is_Integer", False):
+            out += [""] + _labelled("exact:", final, pp)
+        left = sorted(str(x) for x in final.free_symbols)
+        if left:
+            out += ["", "still unknown: " + ", ".join(left)]
+        return "\n".join(out)
+
+    # ---- an inequality, which must be caught before the solve branch:
+    # "3 <= 4" contains an "=" and was being split on it into nonsense.
+    if re.search(r"<=|>=|<|>", norm):
+        expr = parse(norm)
+        out = [prettify_maths(norm), ""]
+        if not getattr(expr, "free_symbols", set()):
+            out.append("true" if bool(expr) else "false")
+            return "\n".join(out)
+        try:
+            out.append(prettify_maths(str(sympy.reduce_inequalities(expr))))
+        except Exception as err:
+            out.append(f"Could not reduce that inequality.\n\n{err}")
+        return "\n".join(out)
+
+    # ---- an "=" and no supplied values means solve
+    if "=" in norm and "==" not in norm:
+        # Several equations at once: "2x + y = 7, x - y = 2". Previously the
+        # whole string was split on the first "=" and the rest became
+        # nonsense.
+        system = split_equations(norm)
+        if system:
+            eqs = []
+            for chunk in system:
+                left, _, right = chunk.partition("=")
+                eqs.append(sympy.Eq(parse(left), parse(right)))
+            syms = sorted(set().union(*(e.free_symbols for e in eqs)),
+                          key=lambda z: z.name)
+            out = [prettify_maths(",   ".join(system)), ""]
+            if not syms:
+                out.append("true" if all(bool(e) for e in eqs) else "false")
+                return "\n".join(out)
+            answers = sympy.solve(eqs, syms, dict=True)
+            if not answers:
+                out.append("no solution")
+            for n, answer in enumerate(answers, 1):
+                if len(answers) > 1:
+                    out.append(f"solution {n}")
+                for z in syms:
+                    if z in answer:
+                        out += _labelled(f"{z} =", answer[z], pp)
+                loose = [z.name for z in syms if z not in answer]
+                if loose:
+                    out.append("free to choose: " + ", ".join(loose))
+            out += ["", f"{len(eqs)} equations, {len(syms)} unknowns"]
+            return "\n".join(out)
+
+        lhs, _, rhs = norm.partition("=")
+        eq = sympy.Eq(parse(lhs), parse(rhs))
+        syms = sorted(eq.free_symbols, key=lambda z: z.name)
+        out = [prettify_maths(norm), ""]
+        if not syms:
+            out.append("true" if bool(eq) else "false")
+            return "\n".join(out)
+        # "solve for y" names the unknown; otherwise take the first.
+        unknown = next((z for z in syms if z.name == target), syms[0])
+        sols = sympy.solve(eq, unknown, dict=False)
+        if not sols:
+            out.append("no solution")
+        for sol in sols:
+            label = f"{unknown} ="
+            out += _labelled(label, sol, pp)
+            if not sol.free_symbols and not _exact_enough(sol):
+                approx = _fmt(sympy.N(sol, 10))
+                if approx != str(sol):
+                    # Indent to the value column so it sits under the
+                    # fraction rather than floating off to one side.
+                    out.append(" " * (len(label) + 1)
+                               + f"≈ {prettify_maths(approx)}")
+        others = [z.name for z in syms if z is not unknown]
+        if others:
+            out += ["", f"solved for {unknown.name}; other unknowns: "
+                        + ", ".join(others)]
+        return "\n".join(out)
+
+    expr = parse(norm)
+
+    # ---- symbolic
+    if expr.free_symbols:
+        simple = sympy.expand(expr)
+        out = [_layout([prettify_maths(norm), simple], pp), ""]
+        factored = sympy.factor(simple)
+        if factored != simple:
+            out += _labelled("factored:", factored, pp)
+        out += ["variables: " + ", ".join(sorted(str(x)
+                                                 for x in expr.free_symbols)),
+                "", "tip: add  with x = 2  to put numbers in"]
+        return "\n".join(out)
+
+    # ---- plain number
+    if expr.is_Integer or _exact_enough(expr):
+        return _layout([prettify_maths(norm), expr], pp)
+    approx = _fmt(sympy.N(expr, 12))
+    out = [_layout([prettify_maths(norm), prettify_maths(approx)], pp)]
+    if str(expr) != approx:
+        out += [""] + _labelled("exact:", expr, pp)
+    return "\n".join(out)
+
+
+# ---- engine 2: no sympy. Arithmetic only, via the AST, because eval() on a
+# ---- selection would execute whatever happened to be highlighted.
+_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.Pow: operator.pow, ast.Mod: operator.mod,
+    ast.FloorDiv: operator.floordiv, ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+}
+
+
+def _ast_calc(node):
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return node.value
+    if isinstance(node, ast.BinOp) and type(node.op) in _OPS:
+        return _OPS[type(node.op)](_ast_calc(node.left), _ast_calc(node.right))
+    if isinstance(node, ast.UnaryOp) and type(node.op) in _OPS:
+        return _OPS[type(node.op)](_ast_calc(node.operand))
+    raise ValueError("only numbers and + - * / // % ** are supported")
+
+
+# ------------------------------------------------------------- unit conversion
+#
+# Hand-rolled rather than sympy.physics.units: a fixed table is predictable,
+# needs no guessing about which spelling sympy knows, and lets temperature -
+# which converts by offset, not by factor - be handled honestly.
+
+_UNITS = {
+    "length": {"m": 1.0, "km": 1000.0, "cm": 0.01, "mm": 0.001,
+               "um": 1e-6, "nm": 1e-9, "mi": 1609.344, "yd": 0.9144,
+               "ft": 0.3048, "in": 0.0254, "nmi": 1852.0,
+               "au": 1.495978707e11, "ly": 9.4607304725808e15},
+    "mass": {"kg": 1.0, "g": 0.001, "mg": 1e-6, "t": 1000.0,
+             "lb": 0.45359237, "oz": 0.028349523125, "st": 6.35029318,
+             "ton": 907.18474, "tonne": 1000.0},
+    "volume": {"l": 1.0, "ml": 0.001, "m3": 1000.0, "cm3": 0.001,
+               "gal": 3.785411784, "qt": 0.946352946, "pt": 0.473176473,
+               "cup": 0.2365882365, "floz": 0.0295735295625,
+               "tbsp": 0.01478676478125, "tsp": 0.00492892159375},
+    "time": {"s": 1.0, "ms": 0.001, "us": 1e-6, "min": 60.0, "h": 3600.0,
+             "d": 86400.0, "wk": 604800.0, "yr": 31557600.0},
+    "speed": {"m/s": 1.0, "km/h": 0.2777777777777778, "mph": 0.44704,
+              "kn": 0.5144444444444445, "ft/s": 0.3048},
+    "area": {"m2": 1.0, "km2": 1e6, "cm2": 1e-4, "ha": 1e4,
+             "acre": 4046.8564224, "sqft": 0.09290304, "sqin": 0.00064516,
+             "sqmi": 2589988.110336},
+    "data": {"B": 1.0, "kB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12,
+             "KiB": 1024.0, "MiB": 1048576.0, "GiB": 1073741824.0,
+             "TiB": 1099511627776.0, "bit": 0.125, "kbit": 125.0,
+             "Mbit": 125000.0, "Gbit": 1.25e8},
+    "energy": {"J": 1.0, "kJ": 1000.0, "cal": 4.184, "kcal": 4184.0,
+               "Wh": 3600.0, "kWh": 3.6e6, "BTU": 1055.05585262,
+               "eV": 1.602176634e-19},
+    "pressure": {"Pa": 1.0, "kPa": 1000.0, "bar": 1e5, "atm": 101325.0,
+                 "psi": 6894.757293168, "mmHg": 133.322387415},
+    "angle": {"rad": 1.0, "deg": 0.017453292519943295,
+              "grad": 0.015707963267948967, "turn": 6.283185307179586},
+}
+
+# Spellings people actually type, mapped to the canonical key above.
+_ALIAS_TABLE = """
+m: metre meter metres meters
+km: kilometre kilometer kilometres kilometers
+cm: centimetre centimeter centimetres centimeters
+mm: millimetre millimeter millimetres millimeters
+um: micrometre micrometer micron microns
+mi: mile miles
+ly: lightyear lightyears
+yd: yard yards
+ft: foot feet
+in: inch inches
+nmi: nauticalmile nauticalmiles
+kg: kilogram kilograms kilo kilos
+g: gram grams
+mg: milligram milligrams
+lb: pound pounds lbs
+oz: ounce ounces
+st: stone stones
+l: litre liter litres liters
+ml: millilitre milliliter millilitres milliliters
+gal: gallon gallons
+qt: quart quarts
+pt: pint pints
+cup: cups
+floz: fluidounce fluidounces
+tbsp: tablespoon tablespoons
+tsp: teaspoon teaspoons
+s: second seconds sec secs
+ms: millisecond milliseconds
+min: minute minutes
+h: hour hours hr hrs
+d: day days
+wk: week weeks
+yr: year years
+km/h: kph kmh kmph
+mph: mileperhour milesperhour
+kn: knot knots
+m2: sqm squaremetre squaremeter
+acre: acres
+ha: hectare hectares
+sqft: squarefoot squarefeet
+B: byte bytes
+kB: kilobyte kilobytes
+MB: megabyte megabytes
+GB: gigabyte gigabytes
+TB: terabyte terabytes
+J: joule joules
+cal: calorie calories
+kcal: kilocalorie kilocalories
+kWh: kilowatthour kilowatthours
+deg: degree degrees
+rad: radian radians
+"""
+
+
+def _build_aliases():
+    out = {}
+    for dim, table in _UNITS.items():
+        for key in table:
+            out[key.lower()] = (dim, key)
+    for line in _ALIAS_TABLE.strip().splitlines():
+        key, _, names = line.partition(":")
+        key = key.strip()
+        target = next(((d, k) for d, t in _UNITS.items()
+                       for k in t if k == key), None)
+        if target is None:
+            continue
+        for name in names.split():
+            out[name.strip().lower()] = target
+    return out
+
+
+_ALIASES = _build_aliases()
+
+# Temperature converts by offset, so it cannot live in the factor table.
+_TEMPS = {"c": "C", "celsius": "C", "centigrade": "C", "°c": "C",
+          "f": "F", "fahrenheit": "F", "°f": "F",
+          "k": "K", "kelvin": "K"}
+
+_CONVERT = re.compile(
+    r"^\s*(.+?)\s*(?:\bto\b|\bin\b|\binto\b|\bas\b|->|→)\s*"
+    r"([A-Za-z°/0-9µ]+)\s*$", re.I)
+_VALUE_UNIT = re.compile(r"(-?[\d.]+(?:[eE][+-]?\d+)?)\s*([A-Za-z°/0-9µ]+)")
+
+
+def _unit_key(name):
+    cleaned = name.strip().lower().replace("²", "2").replace("³", "3")
+    cleaned = cleaned.rstrip(".")
+    if cleaned in _ALIASES:
+        return _ALIASES[cleaned]
+    squashed = cleaned.replace(" ", "").replace("-", "")
+    return _ALIASES.get(squashed)
+
+
+def _num(value):
+    if value == int(value) and abs(value) < 1e15:
+        return f"{int(value):,}"
+    text = f"{value:,.6f}".rstrip("0").rstrip(".")
+    if text in ("0", "-0"):
+        return f"{value:.6g}"
+    return text
+
+
+def _to_temp(value, src, dst):
+    kelvin = {"C": value + 273.15,
+              "F": (value - 32.0) * 5.0 / 9.0 + 273.15,
+              "K": value}[src]
+    return {"C": kelvin - 273.15,
+            "F": (kelvin - 273.15) * 9.0 / 5.0 + 32.0,
+            "K": kelvin}[dst]
+
+
+def convert_units(text):
+    """"5 km to miles", "100 F in C", "3 ft 6 in to cm". None if it is not one."""
+    match = _CONVERT.match(text.strip())
+    if not match:
+        return None
+    left, want = match.group(1), match.group(2)
+
+    # temperature first - offsets, not factors
+    dst_temp = _TEMPS.get(want.strip().lower())
+    pairs = _VALUE_UNIT.findall(left)
+    if dst_temp and len(pairs) == 1:
+        amount, unit = pairs[0]
+        src_temp = _TEMPS.get(unit.strip().lower())
+        if src_temp:
+            got = _to_temp(float(amount), src_temp, dst_temp)
+            def mark(scale):          # kelvin takes no degree sign
+                return scale if scale == "K" else "°" + scale
+            return "\n".join([
+                f"{_num(float(amount))} {mark(src_temp)}"
+                f"   →   {mark(dst_temp)}", "",
+                f"= {_num(got)} {mark(dst_temp)}"])
+
+    target = _unit_key(want)
+    if target is None or not pairs:
+        return None
+    dim, dst = target
+
+    total = 0.0
+    shown = []
+    for amount, unit in pairs:
+        found = _unit_key(unit)
+        if found is None or found[0] != dim:
+            return None
+        total += float(amount) * _UNITS[dim][found[1]]
+        shown.append(f"{_num(float(amount))} {found[1]}")
+
+    answer = total / _UNITS[dim][dst]
+    out = [" + ".join(shown) + f"   →   {dst}", "",
+           f"= {_num(answer)} {dst}"]
+
+    others = [k for k in _UNITS[dim] if k != dst][:7]
+    if others:
+        rows = [(k, _num(total / _UNITS[dim][k])) for k in others]
+        out += ["", f"same amount in other {dim} units", "", _table(rows)]
+    return "\n".join(out)
+
+
+def act_convert(t):
+    done = convert_units(t)
+    if done is not None:
+        return done
+    return ("Not a conversion.\n\n"
+            "Write it like:\n"
+            "    5 km to miles\n"
+            "    100 F in C\n"
+            "    3 ft 6 in to cm\n"
+            "    70 mph to km/h\n"
+            "    2 cups in ml")
+
+
+# ------------------------------------------------------------------- vectors
+#
+# [1, 2, 3] · [4, 5, 6] and [1, 0, 0] × [0, 1, 0]. Like matrices this has to
+# run before the ordinary pipeline, which rewrites [ as ( and turns both ·
+# and × into plain multiplication - at which point the two lists are tuples
+# and the parser gives up.
+
+_VEC_LIT = r"[(\[]\s*[^()\[\]]+?\s*[)\]]"
+_DOT_PROD = re.compile(rf"^\s*({_VEC_LIT})\s*[·⋅•∙]\s*({_VEC_LIT})\s*$")
+_CROSS_PROD = re.compile(rf"^\s*({_VEC_LIT})\s*[×⨯✕]\s*({_VEC_LIT})\s*$")
+
+
+def _vector_cells(text):
+    """Components of a single-level bracketed list, or None.
+
+    Two components minimum, so that "(3) × (4)" stays ordinary scalar
+    multiplication rather than being read as a one-dimensional vector.
+    """
+    cells = [c.strip() for c in text.strip()[1:-1].split(",") if c.strip()]
+    return cells if len(cells) >= 2 else None
+
+
+def vector_calc(text):
+    """A dot or cross product. Returns output, or None."""
+    body, _ = strip_header(text)
+    for pattern, method, title in ((_DOT_PROD, "dot", "dot product"),
+                                   (_CROSS_PROD, "cross", "cross product")):
+        found = pattern.match(body.strip())
+        if not found:
+            continue
+        left = _vector_cells(found.group(1))
+        right = _vector_cells(found.group(2))
+        if not left or not right:
+            continue
+        if len(left) != len(right):
+            return (f"{prettify_maths(body.strip())}\n\n"
+                    f"Those vectors are different lengths: "
+                    f"{len(left)} and {len(right)}.")
+        if method == "cross" and len(left) != 3:
+            return (f"{prettify_maths(body.strip())}\n\n"
+                    f"A cross product needs three components each; "
+                    f"these have {len(left)}.")
+
+        import sympy
+        from sympy.parsing.sympy_parser import (
+            parse_expr, standard_transformations, convert_xor)
+        src = (f"Matrix([{', '.join(left)}]).{method}"
+               f"(Matrix([{', '.join(right)}]))")
+        try:
+            value = parse_expr(
+                src, transformations=standard_transformations + (convert_xor,),
+                local_dict={"Matrix": sympy.Matrix})
+        except Exception as err:
+            return f"{prettify_maths(body.strip())}\n\nCould not work that out.\n\n{err}"
+
+        pp = _printer()
+        out = [title, "", _layout([prettify_maths(body.strip()), value], pp)]
+        if method == "dot":
+            # The angle between them is the usual next question.
+            try:
+                a = sympy.Matrix([parse_expr(c) for c in left])
+                b = sympy.Matrix([parse_expr(c) for c in right])
+                if not (a.free_symbols or b.free_symbols):
+                    na, nb = a.norm(), b.norm()
+                    if na and nb:
+                        angle = sympy.acos(value / (na * nb))
+                        out += ["", _table([
+                            ("|a|", prettify_maths(str(sympy.N(na, 8)))),
+                            ("|b|", prettify_maths(str(sympy.N(nb, 8)))),
+                            ("angle", f"{sympy.N(sympy.deg(angle), 6)}°"),
+                        ])]
+            except Exception:
+                pass
+        return "\n".join(out)
+    return None
+
+
+# ------------------------------------------------------------------ matrices
+#
+# ((1, 2), (3, 4)) and [[1, 2], [3, 4]] both read as a matrix. This has to
+# run before the ordinary pipeline, which turns [ into ( and treats commas
+# as separating equations - either of which destroys a matrix.
+
+_MAT_NESTED = re.compile(r"[(\[]\s*[(\[]")
+_MAT_LITERAL = re.compile(r"[(\[]\s*(?:[(\[][^()\[\]]*[)\]]\s*,?\s*)+[)\]]")
+_MAT_VERBS = {
+    "det": "({m}).det()", "determinant": "({m}).det()",
+    "inv": "({m})**-1", "inverse": "({m})**-1",
+    "transpose": "({m}).T", "rank": "({m}).rank()",
+    "trace": "({m}).trace()", "rref": "({m}).rref()[0]",
+    "eigenvalues": "({m}).eigenvals()", "eigenvals": "({m}).eigenvals()",
+    "eigenvectors": "({m}).eigenvects()",
+    "nullspace": "({m}).nullspace()", "norm": "({m}).norm()",
+}
+
+
+def _matrix_source(text):
+    """Rewrite each matrix literal as Matrix([[...], [...]])."""
+    def one(found):
+        rows = re.findall(r"[(\[]([^()\[\]]*)[)\]]", found.group(0))
+        cells = [[c.strip() for c in row.split(",") if c.strip()]
+                 for row in rows]
+        if not cells or not all(cells):
+            return found.group(0)
+        if len({len(row) for row in cells}) != 1:
+            return found.group(0)      # ragged rows: not a matrix
+        inner = ", ".join("[" + ", ".join(row) + "]" for row in cells)
+        return f"Matrix([{inner}])"
+    return _MAT_LITERAL.sub(one, text)
+
+
+def _matrix_summary(mat, pp, sympy):
+    """What is worth knowing about a matrix you just typed."""
+    rows, cols = mat.shape
+    out = [f"{rows} × {cols} matrix", ""]
+    lines, _ = _block(mat, pp)
+    out += lines
+    facts = []
+    if rows == cols:
+        det = mat.det()
+        facts.append(("det", prettify_maths(str(det))))
+        facts.append(("trace", prettify_maths(str(mat.trace()))))
+        facts.append(("rank", str(mat.rank())))
+        out += ["", _table(facts)]
+        if det != 0:
+            out += ["", "inverse"]
+            inv_lines, _ = _block(mat.inv(), pp)
+            out += inv_lines
+        else:
+            out += ["", "singular — no inverse (det = 0)"]
+    else:
+        facts.append(("rank", str(mat.rank())))
+        out += ["", _table(facts)]
+    return "\n".join(out)
+
+
+def matrix_calc(text):
+    """Anything holding a matrix literal. Returns output, or None."""
+    if not _MAT_NESTED.search(text):
+        return None
+    import sympy
+    from sympy.parsing.sympy_parser import (
+        parse_expr, standard_transformations, convert_xor)
+
+    body, _ = strip_header(text)
+    body = body.strip()
+
+    shape = None
+    bars = re.fullmatch(r"\|\s*(.+?)\s*\|", body, re.S)
+    if bars:
+        body, shape = bars.group(1), "({m}).det()"
+    else:
+        verb = re.match(r"^([A-Za-z]+)\s*(?=[(\[])", body)
+        if verb and verb.group(1).lower() in _MAT_VERBS:
+            shape = _MAT_VERBS[verb.group(1).lower()]
+            body = body[verb.end():]
+
+    src = _matrix_source(normalise_maths(body))
+    if "Matrix(" not in src:
+        return None
+    # "bare" means the selection was nothing but a matrix - then a summary
+    # is what is wanted. M^-1 or A*B is an operation, and should show its
+    # answer instead.
+    bare = shape is None and re.fullmatch(r"Matrix\(\[.*\]\)",
+                                          src.strip(), re.S) is not None
+    if shape:
+        src = shape.format(m=src)
+
+    # No implicit multiplication here: its split_symbols step would try to
+    # read "Matrix" as M*a*t*r*i*x.
+    names = {"Matrix": sympy.Matrix, "eye": sympy.eye, "zeros": sympy.zeros,
+             "ones": sympy.ones, "diag": sympy.diag}
+    try:
+        value = parse_expr(src, transformations=standard_transformations
+                           + (convert_xor,), local_dict=names)
+    except Exception as err:
+        return (f"{prettify_maths(text.strip()[:70])}\n\n"
+                f"Could not read that as a matrix.\n\n{err}")
+
+    pp = _printer()
+    echo = prettify_maths(text.strip())
+
+    try:
+        if isinstance(value, sympy.MatrixBase):
+            if bare:
+                return _matrix_summary(value, pp, sympy)
+            return _layout([echo, value], pp)
+        if isinstance(value, dict):          # eigenvalues
+            rows = [(prettify_maths(str(k)),
+                     f"multiplicity {v}") for k, v in value.items()]
+            return "\n".join([echo, "", "eigenvalues", "", _table(rows)])
+        if isinstance(value, (list, tuple)):
+            out = [echo, ""]
+            for item in value:
+                if isinstance(item, tuple):   # eigenvects: (val, mult, vecs)
+                    out.append(f"λ = {prettify_maths(str(item[0]))}"
+                               f"   (multiplicity {item[1]})")
+                    for vec in item[2]:
+                        out += _block(vec, pp)[0]
+                    out.append("")
+                else:
+                    out += _block(item, pp)[0] + [""]
+            return "\n".join(out).rstrip()
+        return _layout([echo, value], pp)
+    except Exception as err:
+        return f"{echo}\n\nCould not finish that.\n\n{err}"
+
+
+# Symbols with a real mathematical meaning that nothing here implements.
+# Left alone they became variables and the answer came out confidently
+# wrong, which is worse than refusing.
+_NOT_YET = {
+    "∬": "double integrals", "∭": "triple integrals",
+    "∮": "contour integrals", "∇": "the gradient operator ∇",
+    "∈": "set membership", "∉": "set membership", "∋": "set membership",
+    "⊂": "subsets", "⊆": "subsets", "⊃": "supersets", "⊇": "supersets",
+    "∪": "unions", "∩": "intersections", "∖": "set difference",
+    "∅": "the empty set", "∀": "'for all'", "∃": "'there exists'",
+    "∧": "logical and", "∨": "logical or", "¬": "logical not",
+    "⇒": "implication", "⇔": "equivalence", "∴": "'therefore'",
+    "∵": "'because'", "∠": "angles", "⊥": "perpendicularity",
+    "∥": "parallel lines", "≅": "congruence", "∝": "proportionality",
+    "⊕": "direct sums", "⊗": "tensor products",
+}
+
+
+def unsupported_symbols(text):
+    names = []
+    for symbol, name in _NOT_YET.items():
+        if symbol in text and name not in names:
+            names.append(name)
+    return names
+
+
+def act_calc(text):
+    if len(text) > MAX_INPUT:
+        return "Selection is too long to be an expression."
+    missing = unsupported_symbols(text)
+    if missing:
+        return (f"{text.strip()[:70]}\n\nI cannot do "
+                + ", ".join(missing) + " yet.\n\n"
+                "Rather than treat those symbols as variables and hand you "
+                "a confident wrong answer, this stops here.")
+
+    # "5 km to miles" typed into Calculate should just work.
+    converted = convert_units(text)
+    if converted is not None:
+        return converted
+
+    as_vector = vector_calc(text)
+    if as_vector is not None:
+        return as_vector
+
+    # Matrices next: the ordinary pipeline would rewrite their brackets
+    # and split them on their commas.
+    as_matrix = matrix_calc(text)
+    if as_matrix is not None:
+        return as_matrix
+
+    if "±" in text or "∓" in text:
+        def branch(sign_plus):
+            swapped = (text.replace("±", "+").replace("∓", "-")
+                       if sign_plus else
+                       text.replace("±", "-").replace("∓", "+"))
+            return "\n".join("   " + ln
+                             for ln in act_calc(swapped).splitlines())
+        return "\n".join([prettify_maths(text.strip()), "",
+                          "taking  +", branch(True), "",
+                          "taking  −", branch(False)])
+
+    stripped, target = strip_header(text)
+    body, subs_raw = split_subs(stripped)
+    norm = normalise_maths(body)
+    if not norm:
+        return "Nothing to calculate."
+    try:
+        return _sympy_calc(norm, subs_raw, target)
+    except ImportError:
+        pass
+    except Exception as e:
+        return f"{prettify_maths(norm)}\n\nCould not evaluate:\n{e}"
+    try:
+        val = _ast_calc(ast.parse(norm, mode="eval").body)
+    except Exception as e:
+        return (f"{prettify_maths(norm)}\n\nCould not evaluate: {e}\n\n"
+                "Variables and algebra need sympy:\n"
+                "    sudo apt install python3-sympy")
+    return prettify_maths(f"{norm}\n\n= {val}")
+
+
+# ------------------------------------------------------------------- actions
+def trans_run(*args):
+    """translate-shell, with its colour codes turned off at the source.
+
+    By default trans emits bold/underline escapes even when piped, which is
+    why the dictionary output arrived full of stray characters.
+    """
+    return run_out([TRANS, "-no-ansi", *args])
+
+
+def _need_trans():
+    return None if TRANS else (
+        "translate-shell is not installed.\n\n"
+        "    sudo apt install translate-shell")
+
+
+# Targets offered in the dropdown. "trans -b -id" reports a bare code, so
+# codes are what the panel works in and these names are only for display.
+LANGS = [
+    ("en", "English"), ("fr", "French"), ("es", "Spanish"),
+    ("de", "German"), ("it", "Italian"), ("pt", "Portuguese"),
+    ("nl", "Dutch"), ("la", "Latin"), ("ru", "Russian"),
+    ("uk", "Ukrainian"), ("pl", "Polish"), ("sv", "Swedish"),
+    ("el", "Greek"), ("tr", "Turkish"), ("ar", "Arabic"),
+    ("he", "Hebrew"), ("fa", "Persian"), ("hi", "Hindi"),
+    ("ja", "Japanese"), ("ko", "Korean"), ("zh-CN", "Chinese"),
+    ("vi", "Vietnamese"), ("th", "Thai"), ("id", "Indonesian"),
+]
+_LANG_NAME = dict(LANGS)
+_CODE_RE = re.compile(r"[a-z]{2,3}(?:-[A-Za-z]{2,4})?")
+
+
+def lang_name(code):
+    if not code:
+        return ""
+    return _LANG_NAME.get(code) or _LANG_NAME.get(code.split("-")[0]) or code
+
+
+class Panel:
+    """An action result that builds its own widget instead of plain text."""
+
+    def build(self, menu):
+        raise NotImplementedError
+
+    def current_text(self):
+        return ""
+
+    def label_widget(self):
+        """The label holding the result, so a partial selection can be read."""
+        return getattr(self, "_label", None)
+
+
+class TranslatePanel(Panel):
+    """One action for the whole job: detect, translate, and let it be changed.
+
+    Target defaults to English, or French when the text is already English,
+    so the common case needs no interaction. The detected source language
+    sits in the corner.
+
+    trans goes over the network and takes about a second, so every call runs
+    on a worker thread and comes back to the UI through GLib.idle_add -
+    blocking the main loop would freeze the popup mid-translation.
+    """
+
+    def __init__(self, source):
+        self.source = source
+        self.target = None
+        self.out = ""
+        self._syncing = False
+        self._menu = None
+
+    def current_text(self):
+        return self.out
+
+    def build(self, menu):
+        self._menu = menu
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        self._label = Gtk.Label(
+            label="translating\u2026", selectable=True, wrap=True,
+            xalign=0.0, halign=Gtk.Align.START, max_width_chars=46)
+        box.append(self._label)
+
+        bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._drop = Gtk.DropDown.new_from_strings(
+            [name for _, name in LANGS])
+        # 24 entries is a lot to scroll. Search needs an expression telling
+        # the dropdown which property of its items to match on.
+        self._drop.set_expression(
+            Gtk.PropertyExpression.new(Gtk.StringObject, None, "string"))
+        self._drop.set_enable_search(True)
+        self._drop.connect("notify::selected", self._target_changed)
+        bar.append(self._drop)
+        self._from = Gtk.Label(label="", halign=Gtk.Align.END, hexpand=True)
+        self._from.add_css_class("dim-label")
+        bar.append(self._from)
+        box.append(bar)
+
+        threading.Thread(target=self._first, daemon=True).start()
+        return box
+
+    # -- worker side
+    def _first(self):
+        code = trans_run("-b", "-id", "--", self.source).strip().lower()
+        if not _CODE_RE.fullmatch(code):
+            code = ""
+        target = "fr" if code.startswith("en") else "en"
+        text = trans_run("-b", f":{target}", "--", self.source)
+        GLib.idle_add(self._first_done, code, target, text)
+
+    def _again(self, code):
+        text = trans_run("-b", f":{code}", "--", self.source)
+        GLib.idle_add(self._again_done, code, text)
+
+    # -- UI side
+    def _first_done(self, code, target, text):
+        self.target = target
+        self._show(text)
+        self._from.set_label(f"from {lang_name(code)}" if code
+                             else "language unknown")
+        idx = next((i for i, (c, _) in enumerate(LANGS) if c == target), 0)
+        self._syncing = True          # do not re-translate on our own change
+        self._drop.set_selected(idx)
+        self._syncing = False
+        return False
+
+    def _again_done(self, code, text):
+        if code == self.target:       # ignore a reply we no longer want
+            self._show(text)
+        return False
+
+    def _show(self, text):
+        self.out = text
+        self._label.set_label(text)
+        if self._menu is not None:
+            self._menu.note_text(text)
+
+    def _target_changed(self, *_):
+        if self._syncing:
+            return
+        code = LANGS[self._drop.get_selected()][0]
+        if code == self.target:
+            return
+        self.target = code
+        self._label.set_label("translating\u2026")
+        threading.Thread(target=self._again, args=(code,),
+                         daemon=True).start()
+
+
+def act_translate(t):
+    return _need_trans() or TranslatePanel(t)
+
+
+# trans -d is rich but repetitive: every synonym list appears twice, once
+# under its own sense and again in a trailing aggregate block, and the
+# Examples block repeats examples already shown. For a word like "bright"
+# that is about ninety lines. This keeps the per-sense detail, which is the
+# useful arrangement, and drops the duplicate blocks.
+_POS_WORDS = {
+    "noun", "verb", "adjective", "adverb", "pronoun", "preposition",
+    "conjunction", "interjection", "determiner", "exclamation",
+    "abbreviation", "prefix", "suffix", "article", "numeral", "particle",
+}
+_SYN_CAP = 12       # a full list runs to 35 words and buries everything else
+_SENSE_CAP = 10     # "run" has over forty senses; ten is already plenty
+
+
+def _parse_define(raw):
+    """Pull (word, pronunciation, [(pos, senses)], other_forms) out of it."""
+    lines = raw.splitlines()
+    if not lines or not lines[0].strip():
+        return None
+
+    word = lines[0].strip()
+    i, pron = 1, ""
+    if i < len(lines) and lines[i].strip().startswith("/"):
+        pron = lines[i].strip()
+        i += 1
+
+    blocks, forms, cur, mode = [], [], None, None
+    for ln in lines[i:]:
+        if not ln.strip():
+            continue
+        text = ln.strip()
+        if ln[:1] not in (" ", "\t"):          # unindented = a section head
+            low = text.lower()
+            if low in _POS_WORDS:
+                cur = (text, [])
+                blocks.append(cur)
+                mode = "pos"
+            elif low.startswith("see also"):
+                mode = "forms"
+            else:
+                mode = "skip"               # Synonyms / Examples aggregates
+            continue
+        if mode == "forms":
+            forms += [w.strip() for w in text.split(",") if w.strip()]
+        elif mode == "pos" and cur is not None:
+            low = text.lower()
+            if low.startswith(("synonyms:", "antonyms:")) and cur[1]:
+                key = "syn" if low.startswith("syn") else "ant"
+                cur[1][-1][key] = [w.strip() for w
+                                   in text.split(":", 1)[1].split(",")
+                                   if w.strip()]
+            elif text.startswith("- ") and cur[1]:
+                cur[1][-1]["ex"] = text[2:].strip().strip('"')
+            else:
+                cur[1].append({"def": text, "ex": "", "syn": [], "ant": []})
+
+    if not any(senses for _, senses in blocks) and not forms:
+        return None
+    return word, pron, blocks, forms
+
+
+def _render_define(parsed):
+    """Lay it out without relying on column alignment.
+
+    The dictionary renders in the UI font, not monospace, so padding cannot
+    be trusted to line up. Structure comes from blank lines and headings,
+    and long lines are left for the label to wrap.
+    """
+    word, pron, blocks, forms = parsed
+    out = [f"{word}   {pron}".strip(), ""]
+    for pos, senses in blocks:
+        if not senses:
+            continue
+        out.append(pos.upper())
+        for n, sense in enumerate(senses[:_SENSE_CAP], 1):
+            out.append(f"{n}. {sense['def']}")
+            if sense["ex"]:
+                out.append(f"   \u201c{sense['ex']}\u201d")
+            for key, label in (("syn", "synonyms"), ("ant", "antonyms")):
+                words = sense.get(key) or []
+                if not words:
+                    continue
+                more = (f"  (+{len(words) - _SYN_CAP} more)"
+                        if len(words) > _SYN_CAP else "")
+                out.append(f"   {label}: "
+                           + ", ".join(words[:_SYN_CAP]) + more)
+        if len(senses) > _SENSE_CAP:
+            out.append(f"   (+{len(senses) - _SENSE_CAP} more senses)")
+        out.append("")
+    if forms:
+        out.append("other forms: " + ", ".join(forms))
+    return "\n".join(out).rstrip()
+
+
+def act_define(t):
+    missing = _need_trans()
+    if missing:
+        return missing
+    raw = trans_run("-d", ":en", "--", t)
+    parsed = _parse_define(raw)
+    if parsed:
+        return _render_define(parsed)
+
+    # No English dictionary entry. For a word in another language trans -d
+    # just echoes it back, which is useless - what is actually wanted there
+    # is what it means, so translate instead of showing nothing.
+    #
+    # Deliberately NOT branching on detected language: detection on a single
+    # word is unreliable ("maison" comes back as English, "Bonjour" too).
+    # Translating and checking whether the text actually changed is a fact
+    # rather than a guess, and it also rejects gibberish, which translates
+    # to itself.
+    meaning = trans_run("-b", ":en", "--", t).strip()
+    if meaning and meaning.lower() != t.strip().lower():
+        code = trans_run("-b", "-id", "--", t).strip().lower()
+        src = lang_name(code) if _CODE_RE.fullmatch(code) else ""
+        head = f"{src} \u2192 English" if src else "In English"
+        return f"{t}\n\nNo dictionary entry.\n\n{head}:   {meaning}"
+    # "Translations of X" is trans telling us it found no entry and fell back
+    # to a translation table; there is nothing in it worth showing.
+    if "Translations of" not in raw and len(raw.splitlines()) > 3:
+        return raw          # unfamiliar layout - better than losing it
+    return f"{t}\n\nNo dictionary entry found."
+
+
+def counts_line(text):
+    """chars / words / lines for the footer.
+
+    Shown permanently rather than behind an action: it costs nothing to
+    compute and is the sort of thing wanted at a glance, not on request.
+    """
+    if not text:
+        return ""
+
+    def n_of(count, noun):
+        return f"{count:,} {noun}" + ("" if count == 1 else "s")
+
+    parts = [n_of(len(text), "character"),
+             n_of(len(text.split()), "word"),
+             n_of(len(text.splitlines()) or 1, "line")]
+    # Only when it means something. A digest of arbitrary text shown
+    # permanently would be 64 characters of noise.
+    shape = hash_shape(text)
+    if shape:
+        parts.append(f"looks like {shape}")
+    return "   \u00b7   ".join(parts)
+
+
+# --------------------------------------------------------- developer actions
+
+def _int_value(text):
+    """An integer from 0x / 0b / 0o / decimal / trailing-h text, or None."""
+    t = re.sub(r"[,_\s]", "", text.strip())
+    neg = t.startswith("-")
+    if neg:
+        t = t[1:]
+    try:
+        if re.fullmatch(r"0[xX][0-9a-fA-F]+", t):
+            v = int(t, 16)
+        elif re.fullmatch(r"0[bB][01]+", t):
+            v = int(t, 2)
+        elif re.fullmatch(r"0[oO][0-7]+", t):
+            v = int(t, 8)
+        elif re.fullmatch(r"[0-9a-fA-F]+[hH]", t):
+            v = int(t[:-1], 16)
+        elif re.fullmatch(r"\d+", t):
+            v = int(t, 10)
+        else:
+            return None
+    except ValueError:
+        return None
+    return -v if neg else v
+
+
+def _bits(n):
+    """Binary grouped in fours - a 24-bit word is unreadable otherwise."""
+    b = format(n, "b")
+    b = "0" * ((-len(b)) % 4) + b
+    return " ".join(b[i:i + 4] for i in range(0, len(b), 4))
+
+
+def _table(rows):
+    """Label/value pairs in two columns. Needs the monospace font."""
+    width = max(len(k) for k, _ in rows)
+    return "\n".join(f"{k.ljust(width)}   {v}" for k, v in rows)
+
+
+def act_bases(t):
+    n = _int_value(t)
+    if n is None:
+        return (f"{t.strip()[:60]}\n\nNot an integer.\n\n"
+                "Reads: 1234, 1,234, 0x7E, 0b1011, 0o176, 7Eh")
+    sign, m = ("-" if n < 0 else ""), abs(n)
+    rows = [("decimal", f"{sign}{m:,}"),
+            ("hex", f"{sign}0x{m:X}"),
+            ("octal", f"{sign}0o{m:o}"),
+            ("binary", f"{sign}{_bits(m)}"),
+            ("bit width", f"{m.bit_length()} bits")]
+    if 32 <= m <= 126:
+        rows.append(("ASCII", repr(chr(m))))
+    elif 126 < m <= 0xFFFF:
+        rows.append(("unicode", f"U+{m:04X}  {chr(m)!r}"))
+    return _table(rows)
+
+
+def act_json(t):
+    raw = t.strip()
+    if not raw:
+        return "Nothing to format."
+    try:
+        data, kind = json.loads(raw), "JSON"
+    except ValueError as err:
+        # Log lines are often a Python repr rather than JSON - single quotes,
+        # True, None. literal_eval reads that without executing anything.
+        try:
+            data, kind = ast.literal_eval(raw), "Python literal"
+        except (ValueError, SyntaxError):
+            return f"Not valid JSON.\n\n{err}"
+
+    pretty = json.dumps(data, indent=2, ensure_ascii=False)
+    compact = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+    # Input that is already laid out probably wants the opposite done to it.
+    if raw.count("\n") >= 2 and len(compact) < len(raw):
+        head, body = f"{kind}, minified to {len(compact)} chars", compact
+    else:
+        head, body = f"{kind}, formatted", pretty
+
+    if isinstance(data, dict):
+        head += f"   ·   object, {len(data)} keys"
+    elif isinstance(data, list):
+        head += f"   ·   array, {len(data)} items"
+    return f"{head}\n\n{body}"
+
+
+# Splits on separators AND at camelCase humps, so any input shape works.
+_WORD_SPLIT = re.compile(
+    r"[^0-9A-Za-z]+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+
+
+def act_case(t):
+    words = [w for w in _WORD_SPLIT.split(t.strip()) if w]
+    if not words:
+        return "Nothing to convert."
+    low = [w.lower() for w in words]
+    cap = [w.capitalize() for w in low]
+    return _table([
+        ("camelCase", low[0] + "".join(cap[1:])),
+        ("PascalCase", "".join(cap)),
+        ("snake_case", "_".join(low)),
+        ("SCREAMING", "_".join(low).upper()),
+        ("kebab-case", "-".join(low)),
+        ("Title Case", " ".join(cap)),
+        ("lower", " ".join(low)),
+        ("UPPER", " ".join(low).upper()),
+    ])
+
+
+# A spread wide enough to be useful for geography, not just for standups.
+WORLD = [
+    ("Los Angeles", "America/Los_Angeles"), ("Denver", "America/Denver"),
+    ("Chicago", "America/Chicago"), ("New York", "America/New_York"),
+    ("São Paulo", "America/Sao_Paulo"), ("London", "Europe/London"),
+    ("Paris", "Europe/Paris"), ("Cairo", "Africa/Cairo"),
+    ("Moscow", "Europe/Moscow"), ("Dubai", "Asia/Dubai"),
+    ("Mumbai", "Asia/Kolkata"), ("Beijing", "Asia/Shanghai"),
+    ("Tokyo", "Asia/Tokyo"), ("Sydney", "Australia/Sydney"),
+    ("Auckland", "Pacific/Auckland"),
+]
+
+
+def _offset(when):
+    secs = int((when.utcoffset() or datetime.now().utcoffset()
+                or utc_tz.utc.utcoffset(None)).total_seconds())
+    sign = "+" if secs >= 0 else "−"
+    hrs, mins = divmod(abs(secs) // 60, 60)
+    return f"UTC{sign}{hrs}" + (f":{mins:02d}" if mins else "")
+
+
+def _relative(when, now):
+    secs = (when - now).total_seconds()
+    ahead, secs = secs > 0, abs(secs)
+    for size, noun in ((31557600, "year"), (2629800, "month"),
+                       (604800, "week"), (86400, "day"),
+                       (3600, "hour"), (60, "minute")):
+        if secs >= size:
+            n = int(secs / size)
+            unit = noun + ("" if n == 1 else "s")
+            return f"in {n} {unit}" if ahead else f"{n} {unit} ago"
+    return ""
+
+
+def _read_time(text):
+    """(datetime, how it was read), or (None, "") if nothing time-like."""
+    t = text.strip()
+    digits = re.sub(r"[,_\s]", "", t)
+    if re.fullmatch(r"\d{10}", digits):
+        return datetime.fromtimestamp(int(digits), utc_tz.utc), "epoch seconds"
+    if re.fullmatch(r"\d{13}", digits):
+        return (datetime.fromtimestamp(int(digits) / 1000, utc_tz.utc),
+                "epoch milliseconds")
+    try:
+        d = datetime.fromisoformat(t.replace("Z", "+00:00"))
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=datetime.now().astimezone().tzinfo)
+        return d, "ISO timestamp"
+    except ValueError:
+        pass
+    clock = re.fullmatch(
+        r"(\d{1,2})[:h](\d{2})(?::(\d{2}))?\s*(?:([ap])\.?m?\.?)?", t, re.I)
+    if clock:
+        hour, minute = int(clock.group(1)), int(clock.group(2))
+        half = (clock.group(4) or "").lower()
+        if half == "p" and hour < 12:
+            hour += 12
+        elif half == "a" and hour == 12:
+            hour = 0
+        if 0 <= hour < 24 and 0 <= minute < 60:
+            return (datetime.now().astimezone().replace(
+                hour=hour, minute=minute, second=int(clock.group(3) or 0),
+                microsecond=0), "time of day")
+    return None, ""
+
+
+def act_time(t):
+    now = datetime.now().astimezone()
+    when, how = _read_time(t)
+    if when is None:
+        when, how = now, "now  (nothing time-like in the selection)"
+
+    local = when.astimezone(now.tzinfo)
+    rows = [("local", f"{local:%a %d %b %Y, %H:%M:%S}   "
+                      f"{local:%Z} {_offset(local)}"),
+            ("UTC", f"{when.astimezone(utc_tz.utc):%a %d %b %Y, %H:%M:%S}"),
+            ("epoch", str(int(when.timestamp())))]
+    rel = _relative(when, now)
+    if rel:
+        rows.append(("", rel))
+
+    out = [how, "", _table(rows), ""]
+    width = max(len(n) for n, _ in WORLD)
+    for name, zone in WORLD:
+        try:
+            z = when.astimezone(ZoneInfo(zone))
+        except Exception:
+            continue
+        out.append(f"{name.ljust(width)}   {z:%a %H:%M}   {_offset(z)}")
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------- screenshots
+#
+# Through the XDG portal, which is what the Print key uses. The two obvious
+# alternatives do not work here:
+#   - grim/slurp are wlroots tools and cannot see a Mutter session
+#   - org.gnome.Shell.Screenshot answers "AccessDenied: Screenshot is not
+#     allowed" for ordinary callers; GNOME keeps it for its own components
+# gnome-screenshot is not in this release at all.
+
+SHOT_DIR = os.path.expanduser("~/Pictures/Screenshots")
+
+
+def _portal_screenshot(interactive, on_done):
+    """Ask the portal for a shot; later call on_done(uri_or_None, why).
+
+    Asynchronous by design: the reply arrives as a Response signal on a
+    request object, so there is no thread here - the GTK main loop is
+    already running and the portal owns the UI meanwhile.
+    """
+    bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    try:
+        handle = bus.call_sync(
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Screenshot", "Screenshot",
+            GLib.Variant("(sa{sv})", ("", {
+                "interactive": GLib.Variant("b", interactive),
+                "modal": GLib.Variant("b", True),
+            })),
+            GLib.VariantType("(o)"), Gio.DBusCallFlags.NONE,
+            10000, None).unpack()[0]
+    except GLib.Error as err:
+        on_done(None, f"The screenshot portal refused:\n{err.message}")
+        return
+
+    sub = {}
+
+    def responded(_c, _s, _p, _i, _sig, params):
+        if "id" in sub:
+            bus.signal_unsubscribe(sub["id"])
+        code, results = params.unpack()
+        if code == 1:
+            on_done(None, "Cancelled.")
+        elif code != 0 or "uri" not in results:
+            on_done(None, "The portal returned no image.")
+        else:
+            on_done(results["uri"], "")
+
+    sub["id"] = bus.signal_subscribe(
+        "org.freedesktop.portal.Desktop",
+        "org.freedesktop.portal.Request", "Response", handle, None,
+        Gio.DBusSignalFlags.NONE, responded)
+
+
+def _store_shot(uri):
+    """Move the portal's file into ~/Pictures/Screenshots under a real name.
+
+    Left alone it drops Screenshot-1.png straight into ~/Pictures, which
+    clutters that folder and tells you nothing when you look later.
+    """
+    src = uri[7:] if uri.startswith("file://") else uri
+    src = urllib.parse.unquote(src)
+    if not os.path.exists(src):
+        return src
+    os.makedirs(SHOT_DIR, exist_ok=True)
+    stamp = datetime.now().strftime("%Y-%m-%d %H-%M-%S")
+    dest = os.path.join(SHOT_DIR, f"Screenshot from {stamp}.png")
+    n = 2
+    while os.path.exists(dest):
+        dest = os.path.join(SHOT_DIR, f"Screenshot from {stamp} ({n}).png")
+        n += 1
+    try:
+        shutil.move(src, dest)
+        return dest
+    except OSError:
+        return src
+
+
+def copy_image(path):
+    """Put the PNG itself on the clipboard, not just its path.
+
+    wl-copy rather than GDK: it keeps the offer alive after this process
+    exits, which is what makes the shot pasteable a minute later.
+    """
+    try:
+        with open(path, "rb") as fh:
+            subprocess.run(["wl-copy", "--type", "image/png"],
+                           stdin=fh, timeout=10)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+class ShotPanel(Panel):
+    """Hide the popup, capture, then come back and report.
+
+    Hidden rather than closed: closing the last window ends the process, and
+    there would be nothing left to receive the portal's reply.
+    """
+
+    def __init__(self, interactive=True):
+        self.interactive = interactive
+        self.out = ""
+        self._menu = None
+        self._path = None
+
+    def current_text(self):
+        return self.out
+
+    def build(self, menu):
+        self._menu = menu
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._label = Gtk.Label(
+            label=("drag a region…" if self.interactive
+                   else "capturing…"),
+            selectable=True, wrap=True, xalign=0.0,
+            halign=Gtk.Align.START, max_width_chars=46)
+        box.append(self._label)
+
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        self._open = Gtk.Button(label="Open", sensitive=False)
+        self._open.connect("clicked", self._open_clicked)
+        row.append(self._open)
+        self._folder = Gtk.Button(label="Show folder", sensitive=False)
+        self._folder.connect(
+            "clicked", lambda *_: subprocess.Popen(["xdg-open", SHOT_DIR]))
+        row.append(self._folder)
+        box.append(row)
+
+        # Out of frame, and flagged busy so losing focus is not mistaken for
+        # the person clicking away.
+        menu._busy = True
+        menu.set_visible(False)
+        GLib.timeout_add(250, self._start)   # let the compositor drop it
+        return box
+
+    def _start(self):
+        _portal_screenshot(self.interactive, self._finished)
+        return False
+
+    def _finished(self, uri, why):
+        if uri:
+            path = _store_shot(uri)
+            self._path = self.out = path
+            copied = copy_image(path)
+            kb = (os.path.getsize(path) // 1024
+                  if os.path.exists(path) else 0)
+            self._label.set_label(
+                f"{os.path.basename(path)}\n{kb:,} kB"
+                + ("\n\nimage copied — paste it anywhere"
+                   if copied else ""))
+            self._open.set_sensitive(True)
+            self._folder.set_sensitive(True)
+            # Deliberately NOT menu.note_text(path): the clipboard holds the
+            # image, and writing the path over it would be a downgrade. The
+            # Copy button still yields the path via current_text().
+        else:
+            self._label.set_label(why)
+
+        menu = self._menu
+        if menu is not None:
+            menu._busy = False
+            menu.set_visible(True)
+            menu.present()
+
+    def _open_clicked(self, *_):
+        if self._path:
+            subprocess.Popen(["xdg-open", self._path])
+
+
+class SelectAllPanel(Panel):
+    """Select everything in the window we came from, then reopen on it."""
+
+    def __init__(self):
+        self.out = ""
+
+    def current_text(self):
+        return self.out
+
+    def build(self, menu):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self._label = Gtk.Label(
+            label="selecting everything in that window…",
+            selectable=True, wrap=True, xalign=0.0,
+            halign=Gtk.Align.START, max_width_chars=46)
+        box.append(self._label)
+        # Deferred so this row finishes being built before the window hides.
+        GLib.timeout_add(60, lambda: (menu.grab_all(), False)[1])
+        return box
+
+
+def act_select_all(t):
+    if not YDOTOOL:
+        return ("ydotool is not installed, so nothing here can reach the "
+                "other window.\n\n    sudo apt install ydotool")
+    return SelectAllPanel()
+
+
+def act_screenshot(t):
+    # Interactive: GNOME's own screenshot UI, which already offers a drag
+    # region, a window, or the whole screen. A second non-interactive entry
+    # just duplicated one of its buttons.
+    return ShotPanel(True)
+
+
+# ------------------------------------------- characters and checksums
+
+_CATEGORY = {
+    "Lu": "letter, uppercase", "Ll": "letter, lowercase",
+    "Lt": "letter, titlecase", "Lm": "letter, modifier",
+    "Lo": "letter, other", "Mn": "mark, non-spacing",
+    "Mc": "mark, spacing combining", "Me": "mark, enclosing",
+    "Nd": "number, decimal digit", "Nl": "number, letter",
+    "No": "number, other", "Pc": "punctuation, connector",
+    "Pd": "punctuation, dash", "Ps": "punctuation, open",
+    "Pe": "punctuation, close", "Pi": "punctuation, initial quote",
+    "Pf": "punctuation, final quote", "Po": "punctuation, other",
+    "Sm": "symbol, math", "Sc": "symbol, currency",
+    "Sk": "symbol, modifier", "So": "symbol, other",
+    "Zs": "separator, space", "Zl": "separator, line",
+    "Zp": "separator, paragraph", "Cc": "control", "Cf": "format",
+    "Cs": "surrogate", "Co": "private use", "Cn": "unassigned",
+}
+_CHAR_CAP = 32
+
+
+def _char_name(ch):
+    try:
+        return unicodedata.name(ch)
+    except ValueError:
+        return "<unnamed>"
+
+
+def _entity(cp):
+    named = html_entities.codepoint2name.get(cp)
+    numeric = f"&#{cp};"
+    return f"&{named};   or   {numeric}" if named else numeric
+
+
+def _printable(ch):
+    """A safe stand-in for characters that would wreck the layout."""
+    return " " if unicodedata.category(ch)[0] in ("C", "Z") else ch
+
+
+def act_chars(t):
+    if not t:
+        return "Nothing selected."
+
+    # One character is the usual case - "what IS this thing?" - and deserves
+    # the full picture. Several get a compact row each instead.
+    if len(t) == 1:
+        ch = t
+        cp = ord(ch)
+        cat = unicodedata.category(ch)
+        rows = [("character", _printable(ch) or "(not printable)"),
+                ("codepoint", f"U+{cp:04X}"),
+                ("name", _char_name(ch)),
+                ("category", f"{cat}   {_CATEGORY.get(cat, '')}".rstrip()),
+                ("HTML", _entity(cp)),
+                ("decimal", str(cp)),
+                ("UTF-8", " ".join(f"{b:02x}" for b in ch.encode())),
+                ("UTF-16", " ".join(f"{b:02x}" for b
+                                    in ch.encode("utf-16-be")))]
+        if unicodedata.decomposition(ch):
+            rows.append(("decomposes", unicodedata.decomposition(ch)))
+        if unicodedata.combining(ch):
+            rows.append(("combining", str(unicodedata.combining(ch))))
+        return _table(rows)
+
+    shown = t[:_CHAR_CAP]
+    out = [f"{len(t):,} characters   ·   "
+           f"{len(t.encode()):,} bytes UTF-8", ""]
+    for ch in shown:
+        cp = ord(ch)
+        name = _char_name(ch)
+        out.append(f"{_printable(ch)}  U+{cp:04X}  {name[:34]}")
+    if len(t) > _CHAR_CAP:
+        out.append(f"… and {len(t) - _CHAR_CAP:,} more")
+
+    # Text that looks identical but is not: a composed e-acute versus an e
+    # followed by a combining accent. Worth saying, because it is exactly
+    # the kind of thing that makes a string comparison fail.
+    nfc = unicodedata.normalize("NFC", t)
+    if nfc != t:
+        out += ["", f"not NFC-normalised — NFC form is "
+                    f"{len(nfc):,} characters"]
+    return "\n".join(out)
+
+
+# Lengths are the only clue a bare hex string gives about its algorithm.
+_HASH_SHAPES = {8: "CRC32", 32: "MD5", 40: "SHA-1", 56: "SHA-224",
+                64: "SHA-256", 96: "SHA-384", 128: "SHA-512"}
+_HASH_FUNCS = {32: hashlib.md5, 40: hashlib.sha1, 56: hashlib.sha224,
+               64: hashlib.sha256, 96: hashlib.sha384, 128: hashlib.sha512}
+
+# How every checksum file in the world is laid out: digest, space, filename.
+# The star marks binary mode in md5sum/sha256sum output.
+_CHECKSUM_LINE = re.compile(r"^\s*([0-9a-fA-F]{8,128})\s+\*?(\S.*?)\s*$")
+
+
+def hash_shape(text):
+    """Which algorithm a bare hex string is the right length to be."""
+    t = text.strip()
+    if 8 <= len(t) <= 128 and re.fullmatch(r"[0-9a-fA-F]+", t):
+        return _HASH_SHAPES.get(len(t))
+    return None
+
+
+def _find_file(name):
+    """Resolve a filename from a checksum line.
+
+    Downloads are where this is nearly always pointed, and a checksum line
+    carries a bare filename with no directory, so that is worth trying.
+    """
+    for candidate in (name, os.path.expanduser(name),
+                      os.path.expanduser(f"~/Downloads/{name}"),
+                      os.path.expanduser(f"~/Desktop/{name}")):
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _digest_file(path, func):
+    h = func()
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(1 << 20)     # streamed: files get large
+                if not chunk:
+                    break
+                h.update(chunk)
+    except OSError as err:
+        return None, str(err)
+    return h.hexdigest(), None
+
+
+def _verify(expected, name):
+    """Hash the named file and say whether it matches the given digest."""
+    func = _HASH_FUNCS.get(len(expected))
+    algo = _HASH_SHAPES.get(len(expected), "unknown")
+    if func is None:
+        return f"{expected}\n\nNo algorithm produces a {len(expected)}-character digest."
+    path = _find_file(name)
+    if path is None:
+        return (f"{name}\n\nCannot find that file.\n\n"
+                f"Looked beside it, in ~/Downloads and ~/Desktop.\n"
+                f"Highlight the full path instead and I will hash it.")
+    actual, err = _digest_file(path, func)
+    if err:
+        return f"Could not read {path}.\n\n{err}"
+    ok = actual.lower() == expected.lower()
+    return "\n".join([
+        os.path.basename(path),
+        f"{os.path.getsize(path):,} bytes   ·   {algo}",
+        "",
+        "✓  MATCHES" if ok else "✗  DOES NOT MATCH",
+        "",
+        "expected", expected.lower(),
+        "",
+        "actual", actual,
+    ])
+
+
+def _hash_rows(data):
+    rows = [("md5", hashlib.md5(data).hexdigest()),
+            ("sha1", hashlib.sha1(data).hexdigest()),
+            ("crc32", f"{zlib.crc32(data) & 0xFFFFFFFF:08x}")]
+    long_rows = [("sha256", hashlib.sha256(data).hexdigest()),
+                 ("sha512", hashlib.sha512(data).hexdigest())]
+    return rows, long_rows
+
+
+def _hash_layout(head, short_rows, long_rows):
+    # The long digests go on their own line: at 64 and 128 characters they
+    # will not sit beside a label without wrapping into the column.
+    out = [head, "", _table(short_rows)]
+    for name, digest in long_rows:
+        out += ["", name, digest]
+    return "\n".join(out)
+
+
+def act_hash(t):
+    raw = t.strip().strip("\"'")
+
+    # A checksum line - "<digest>  <filename>" - is the download-validation
+    # case, and the only one where a hash can actually be checked rather
+    # than just computed. Try it before anything else.
+    line = _CHECKSUM_LINE.match(t.strip())
+    if line and not os.path.isfile(os.path.expanduser(raw)):
+        return _verify(line.group(1), line.group(2))
+
+    shape = hash_shape(raw)
+    if shape and not os.path.exists(os.path.expanduser(raw)):
+        return (f"{raw}\n\n{len(raw)} hex characters — the right "
+                f"length for {shape}.\n\n"
+                "To check a file against it, highlight the whole checksum "
+                "line:\n\n    " + raw[:16] + "…  filename.iso")
+
+    path = os.path.expanduser(raw)
+    # A path means hash the file, which is the actually useful case -
+    # checking a download against a published checksum.
+    if raw and os.path.isfile(path):
+        md5, sha1, sha256, sha512 = (hashlib.md5(), hashlib.sha1(),
+                                     hashlib.sha256(), hashlib.sha512())
+        crc = 0
+        try:
+            with open(path, "rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 20)   # streamed: files get large
+                    if not chunk:
+                        break
+                    for h in (md5, sha1, sha256, sha512):
+                        h.update(chunk)
+                    crc = zlib.crc32(chunk, crc)
+        except OSError as err:
+            return f"Could not read the file.\n\n{err}"
+        size = os.path.getsize(path)
+        return _hash_layout(
+            f"{os.path.basename(path)}\n{size:,} bytes",
+            [("md5", md5.hexdigest()), ("sha1", sha1.hexdigest()),
+             ("crc32", f"{crc & 0xFFFFFFFF:08x}")],
+            [("sha256", sha256.hexdigest()),
+             ("sha512", sha512.hexdigest())])
+
+    if not t:
+        return "Nothing to hash."
+    data = t.encode("utf-8")
+    short_rows, long_rows = _hash_rows(data)
+    return _hash_layout(f"text   ·   {len(data):,} bytes UTF-8",
+                        short_rows, long_rows)
+
+
+def act_search(t):
+    subprocess.Popen(["xdg-open",
+                      "https://duckduckgo.com/?q=" + urllib.parse.quote(t)])
+    return None
+
+
+def _unhandled(path):
+    """The file's type, if nothing is registered to open it; else None.
+
+    xdg-open is fire-and-forget, so without this check a file with no
+    handler silently does nothing and the menu just closes - which is
+    indistinguishable from the action being broken.
+    """
+    try:
+        kind = subprocess.run(["xdg-mime", "query", "filetype", path],
+                              capture_output=True, text=True,
+                              timeout=5).stdout.strip()
+        if not kind:
+            return None
+        app = subprocess.run(["xdg-mime", "query", "default", kind],
+                             capture_output=True, text=True,
+                             timeout=5).stdout.strip()
+        return None if app else kind
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def act_open(t):
+    """A local file or folder, or a web address - whichever it actually is.
+
+    The old version prefixed anything without a scheme with https://, so a
+    path became https:///home/sebastian/... and opened nothing.
+    """
+    # Backticks and angle brackets come along when the path was copied out
+    # of formatted output.
+    raw = t.strip().strip("\"'`<>").strip()
+    if raw.startswith("file://"):
+        subprocess.Popen(["xdg-open", raw])
+        return None
+
+    # A terminal wrapping a long path puts a newline - and sometimes an
+    # indent - in the middle of it. Only the newline and the whitespace
+    # right after it are removed: a path may legitimately contain a double
+    # space, so runs of spaces are left alone.
+    tries = [raw]
+    if "\n" in raw:
+        tries.append(re.sub(r"\n[ \t]*", "", raw))
+
+    looks_local = raw.startswith(("~", "/", "./", "../"))
+    for candidate in tries:
+        path = os.path.expanduser(candidate)
+        if os.path.exists(path):
+            orphan = _unhandled(path)
+            if orphan:
+                return (f"{os.path.basename(path)}\n\n"
+                        f"Nothing on this system is registered to open "
+                        f"{orphan} files.\n\n"
+                        f"The file is fine - there is no viewer installed.")
+            subprocess.Popen(["xdg-open", path])
+            return None
+    if looks_local:
+        return f"{raw[:70]}\n\nNo such file or folder."
+    path = os.path.expanduser(raw)
+    if "://" in raw:
+        subprocess.Popen(["xdg-open", raw])
+        return None
+    if re.fullmatch(r"[\w.-]+\.[A-Za-z]{2,}(?:[/?#].*)?", raw):
+        subprocess.Popen(["xdg-open", "https://" + raw])
+        return None
+    return f"{raw[:60]}\n\nNot a file, folder or web address."
+
+
+def act_copy(t):
+    copy(t)
+    notify(f"{len(t)} characters copied")
+    return None
+
+
+# label, function. Returning None means "just act and close".
+ACTIONS = [
+    ("Calculate", act_calc),
+    ("Translate", act_translate),
+    ("Define / dictionary", act_define),
+    ("Bases  (hex / binary / octal)", act_bases),
+    ("Format JSON", act_json),
+    ("Change case", act_case),
+    ("Convert units", act_convert),
+    ("Times and time zones", act_time),
+    ("Inspect characters", act_chars),
+    ("Hashes / checksums", act_hash),
+    ("Select all in that window", act_select_all),
+    ("Screenshot", act_screenshot),
+    ("Search the web", act_search),
+    ("Open file or link", act_open),
+    ("Copy to clipboard", act_copy),
+]
+
+# These lay values out in columns, so they need the fixed-width font.
+_MONO_ACTIONS = {act_calc, act_bases, act_json, act_case, act_time,
+                 act_chars, act_hash, act_convert}
+
+
+# ----------------------------------------------------------------------- ui
+_CSS = b"""
+.qm-mono   { font-family: monospace; font-size: 0.95em; }
+.qm-text   { font-size: 1.0em; }
+.qm-head   { font-size: 0.9em; }
+.qm-panel  { border: 1px solid alpha(currentColor, 0.18); }
+"""
+
+
+class Menu(Gtk.ApplicationWindow):
+    def __init__(self, app, text):
+        super().__init__(application=app, title=QM_TITLE)
+        self.text = text
+        self._result_row = None
+        # Deliberately narrow. max-width-chars below is a wrap limit,
+        # not a minimum, so the window stays this slim for the menu and
+        # widens only when a result genuinely needs the room.
+        self.set_default_size(380, -1)
+        self.set_resizable(False)
+        self.set_decorated(False)          # no titlebar
+        self.add_css_class("qm-panel")
+
+        # Dismiss on focus loss, like a context menu.
+        #
+        # _seen_focus guards the obvious bug: a just-presented window reports
+        # inactive for a moment before the compositor focuses it, and acting
+        # on that first False would close the menu as it opened. Only a loss
+        # that FOLLOWS having had focus counts.
+        self._seen_focus = False
+        self._done = False
+        self._busy = False
+        self._last_result = None
+        self._result_label = None
+        self._get_text = None
+        self.connect("notify::is-active", self._active_changed)
+        # A GDK clipboard offer dies with the process, so hand the answer to
+        # wl-copy on the way out. Focus no longer matters once we are closing.
+        self.connect("destroy", self._persist_clipboard)
+        self.connect("close-request", lambda *_: (self._save_place(),
+                                                  False)[1])
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.set_child(root)
+
+        preview = text.replace("\n", " ")
+        if len(preview) > 52:
+            preview = preview[:51] + "…"
+        head = Gtk.Label(
+            label=f"“{preview}”" if preview
+            else "nothing highlighted — Screenshot and Select all "
+                 "still work",
+            halign=Gtk.Align.START, wrap=True, max_width_chars=40,
+            margin_top=10, margin_bottom=8, margin_start=12, margin_end=12)
+        head.add_css_class("dim-label")
+        head.add_css_class("qm-head")
+
+        # With no titlebar there is nothing to grab, so the header text is the
+        # drag handle. A WindowHandle forwards a press-and-drag on its child
+        # to the compositor as a window move.
+        self.head = head
+        handle = Gtk.WindowHandle()
+        handle.set_child(head)
+        root.append(handle)
+
+        self.filter = Gtk.SearchEntry(
+            placeholder_text="Filter…",
+            margin_start=8, margin_end=8, margin_bottom=6)
+        self.filter.connect("search-changed",
+                            lambda *_: self.list.invalidate_filter())
+        self.filter.connect("activate", self._activate_first)
+        root.append(self.filter)
+
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.list.set_filter_func(self._matches)
+        self.list.connect("row-activated", self._chosen)
+        # One flat list, in ACTIONS order. A split by "does it read the
+        # selection" looked tidy but was wrong: Times reads an epoch or an
+        # ISO stamp out of the selection and only falls back to now, so
+        # almost everything belongs on the same side of any such line.
+        for label, fn in ACTIONS:
+            row = Gtk.ListBoxRow()
+            row.fn, row.label_text = fn, label
+            row.is_result = False
+            row.set_child(Gtk.Label(
+                label=label, halign=Gtk.Align.START, margin_top=8,
+                margin_bottom=8, margin_start=12, margin_end=12))
+            self.list.append(row)
+
+        scroll = Gtk.ScrolledWindow(
+            propagate_natural_height=True, max_content_height=620,
+            hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.set_child(self.list)
+        root.append(scroll)
+
+        line = counts_line(text)
+        if line:
+            footer = Gtk.Label(
+                label=line, selectable=True, halign=Gtk.Align.START,
+                margin_top=6, margin_bottom=10,
+                margin_start=12, margin_end=12)
+            footer.add_css_class("dim-label")
+            footer.add_css_class("qm-head")
+            root.append(footer)
+            self.footer = footer
+
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", self._key)
+        self.add_controller(keys)
+
+        # Once mapped, hop to the pointer if we are in a position to.
+        # Retried: at the first attempt the window may not be mapped in X
+        # yet, and its height is not final either - and the height decides
+        # whether the menu goes above or below the pointer.
+        self._place_tries = 0
+        self.connect("map",
+                     lambda *_: GLib.timeout_add(40, self._place_at_pointer))
+
+    # -- behaviour
+    def _active_changed(self, *_):
+        if self.is_active():
+            self._seen_focus = True
+            return
+        if self._done or not self._seen_focus:
+            return
+        # Do not dismiss on the first sign of lost focus. Notifications and
+        # clipboard helpers can take it for a moment without the user having
+        # clicked anywhere, and dismissing then discards the result. Re-check
+        # shortly and only close if focus really went elsewhere.
+        GLib.timeout_add(350, self._dismiss_if_really_gone)
+
+    def _dismiss_if_really_gone(self):
+        if not self._done and not self._busy and not self.is_active():
+            self.close()
+        return False
+
+    def _save_place(self, *_):
+        """Record where the window ended up, so it reopens there.
+
+        Read back from X rather than tracked internally, because the person
+        moves it by dragging the header and the application is never told.
+        """
+        if not (XDOTOOL and _on_x11()):
+            return
+        try:
+            found = subprocess.run([XDOTOOL, "search", "--name", QM_TITLE],
+                                   capture_output=True, text=True, timeout=3)
+            ids = found.stdout.split()
+            if not ids:
+                return
+            geo = subprocess.run(
+                [XDOTOOL, "getwindowgeometry", "--shell", ids[-1]],
+                capture_output=True, text=True, timeout=3).stdout
+            spot = {}
+            for line in geo.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    spot[key] = value
+            remember_place(int(spot["X"]), int(spot["Y"]))
+        except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+            pass
+
+    def _persist_clipboard(self, *_):
+        if self._last_result:
+            copy(self._last_result)
+
+    def _key(self, _c, keyval, _code, state):
+        if keyval == Gdk.KEY_Escape:
+            self.close()
+            return True
+        if (keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter)
+                and state & Gdk.ModifierType.CONTROL_MASK):
+            self.replace_selection(self._pick_text())
+            return True
+        return False
+
+    # ------------------------------------------------------ paste in place
+    def _pick_text(self):
+        """What Copy and Replace act on.
+
+        If part of the result is highlighted, that part; otherwise all of
+        it. This is what makes the multi-row outputs usable - with Change
+        case or Bases you highlight the one line you want and replace with
+        exactly that.
+        """
+        label = self._result_label
+        if label is not None:
+            try:
+                found, start, end = label.get_selection_bounds()
+            except Exception:
+                found = False
+            if found and end > start:
+                return label.get_text()[start:end]
+        return self._get_text() if self._get_text else ""
+
+    def replace_selection(self, text):
+        """Paste over whatever is still highlighted in the other application.
+
+        A paste, not backspace-and-retype. Reading the PRIMARY selection
+        does not clear it, so the original text is still selected over
+        there and Ctrl+V overwrites exactly that span - no guessing how
+        many characters to delete, and it works the same in a text editor,
+        a browser field or a terminal.
+        """
+        if not text:
+            return
+        if not YDOTOOL:
+            self._note("ydotool is not installed, so there is nothing that "
+                       "can type into another window.\n\n"
+                       "    sudo apt install ydotool")
+            return
+        # wl-copy, not GDK: the paste lands after this process has gone, so
+        # the clipboard offer has to outlive it.
+        copy(text)
+        self._done = True           # hiding must not read as a dismissal
+        self.set_visible(False)
+        GLib.timeout_add(320, self._send_paste)
+
+    def _send_keys(self, *codes):
+        """Press a chord and release it. Returns None, or why it failed."""
+        env = dict(os.environ)
+        env.setdefault("YDOTOOL_SOCKET", YDOTOOL_SOCKET)
+        seq = ([f"{c}:1" for c in codes]
+               + [f"{c}:0" for c in reversed(codes)])
+        try:
+            done = subprocess.run([YDOTOOL, "key", *seq], timeout=8,
+                                  capture_output=True, text=True, env=env)
+        except (OSError, subprocess.SubprocessError) as err:
+            return str(err)
+        if done.returncode != 0:
+            return ((done.stderr or done.stdout or "").strip()
+                    or f"ydotool exited {done.returncode}")
+        return None
+
+    def _send_paste(self):
+        trouble = self._send_keys(_K_CTRL, _K_V)
+        if trouble:
+            # Come back and say so rather than vanish having done nothing.
+            self._done = False
+            self.set_visible(True)
+            self.present()
+            self._note(f"Could not paste.\n\n{trouble}\n\n"
+                       "The text is on your clipboard either way, so "
+                       "Ctrl+V still works.")
+            return False
+        GLib.timeout_add(120, self._after_paste)
+        return False
+
+    def _after_paste(self):
+        self.close()
+        return False
+
+    def _place_at_pointer(self):
+        """Move this window to the pointer, where that is possible at all.
+
+        GTK4 removed window positioning outright, and Wayland forbids a
+        client from placing its own surface - so this goes out through
+        xdotool, which can only see the window while we are an X11 client.
+        Launch with GDK_BACKEND=x11 and it lands at the pointer; launch
+        natively and it stays centred, which is Wayland working as designed
+        rather than a fault.
+        """
+        self._place_tries += 1
+        first = self._place_tries == 1
+
+        # The real answer: the shell extension knows where the pointer is.
+        placed = shell_place_at_pointer(QM_TITLE)
+        if placed:
+            note(f"placed at the pointer by the extension "
+                 f"(try {self._place_tries})")
+            return False
+
+        # It answered but has not seen the window yet - worth another look.
+        if placed is False and self._place_tries < 4:
+            GLib.timeout_add(120, self._place_at_pointer)
+            return False
+
+        # Extension absent - fall back to wherever it was last dragged,
+        # which needs X11 because that route goes through xdotool.
+        if not (XDOTOOL and _on_x11()):
+            note("no placement: the qmplace extension is not loaded "
+                 "(log out and back in) and this is not an X11 client")
+            return False
+        where = saved_place()
+        if where is None:
+            note("extension not loaded; no saved position either - "
+                 "drag the window and it will reopen there")
+            return False
+        try:
+            found = subprocess.run([XDOTOOL, "search", "--name", QM_TITLE],
+                                   capture_output=True, text=True, timeout=3)
+            ids = found.stdout.split()
+            if not ids:
+                if self._place_tries < 4:
+                    GLib.timeout_add(120, self._place_at_pointer)
+                else:
+                    note("no placement: xdotool never found the window")
+                return False
+            wid = ids[-1]
+            geo = subprocess.run(
+                [XDOTOOL, "getwindowgeometry", "--shell", wid],
+                capture_output=True, text=True, timeout=3).stdout
+            size = {}
+            for line in geo.splitlines():
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    size[key] = value
+            x, y = where
+            subprocess.run([XDOTOOL, "windowmove", wid, str(x), str(y)],
+                           timeout=3, capture_output=True)
+            note(f"restored to {x},{y} "
+                 f"(window {size.get('WIDTH')}x{size.get('HEIGHT')}, "
+                 f"try {self._place_tries})")
+        except (OSError, subprocess.SubprocessError, ValueError) as err:
+            note(f"placement failed: {err}")
+        return False
+
+    def _note(self, message):
+        if self._result_label is not None:
+            self._result_label.set_label(message)
+
+    def _note_header(self, message):
+        if getattr(self, "head", None) is not None:
+            self.head.set_label(message)
+
+    # --------------------------------------------- grab the whole window
+    def grab_all(self):
+        """Select everything in the window we came from and reload with it.
+
+        Ctrl+A then Ctrl+Insert - deliberately NOT Ctrl+C, because in a
+        terminal Ctrl+C sends SIGINT and would interrupt whatever is running
+        there. Ctrl+Insert means copy in GTK, Qt, browsers and VTE alike,
+        and is harmless everywhere else.
+
+        It does overwrite the clipboard, which is the price of reading the
+        text at all - there is no way to ask another window for its
+        contents on Wayland.
+        """
+        if not YDOTOOL:
+            self._note_header("ydotool is not installed")
+            return
+        self._busy = True
+        self._drop_result()
+        self.set_visible(False)
+        GLib.timeout_add(280, self._grab_select)
+
+    def _grab_select(self):
+        self._send_keys(_K_CTRL, _K_A)
+        GLib.timeout_add(140, self._grab_copy)
+        return False
+
+    def _grab_copy(self):
+        self._send_keys(_K_CTRL, _K_INS)
+        GLib.timeout_add(280, self._grab_done)
+        return False
+
+    def _grab_done(self):
+        grabbed = clipboard_text().strip()
+        self._busy = False
+        if grabbed:
+            # Get out of the way. The selection is live in the other window
+            # and on the clipboard, so pressing the key again acts on all
+            # of it - no need to reappear in between.
+            self._done = True
+            self.close()
+            return False
+        # Only come back if it did not work, to say so.
+        self.set_visible(True)
+        self.present()
+        self._note_header("Nothing came back — that window may not "
+                          "do select-all.")
+        return False
+
+    def _matches(self, row):
+        if row.is_result:
+            return True
+        q = self.filter.get_text().strip().lower()
+        return q in row.label_text.lower() if q else True
+
+    def _activate_first(self, *_):
+        i = 0
+        while (row := self.list.get_row_at_index(i)) is not None:
+            if row.fn is not None and self._matches(row):
+                self._chosen(self.list, row)
+                return
+            i += 1
+
+    # -- results, inline
+    def _drop_result(self):
+        if self._result_row is not None:
+            self.list.remove(self._result_row)
+            self._result_row = None
+
+    def _chosen(self, _list, row):
+        if row.is_result or row.fn is None:
+            return
+        self._drop_result()
+        self._busy = True
+        try:
+            body = row.fn(self.text)
+        except Exception as e:
+            body = f"{row.label_text} failed:\n\n{e}"
+        finally:
+            self._busy = False
+        if body is None:
+            self._done = True
+            self.close()
+            return
+        # Only the maths output needs a fixed-width font; it is what keeps
+        # the fraction bars and the = column lined up. Prose in monospace
+        # just renders IPA and accents badly.
+        self._show_result(row.get_index(), body, mono=row.fn in _MONO_ACTIONS)
+
+    def _show_result(self, index, body, mono=False):
+        holder = Gtk.ListBoxRow(activatable=False, selectable=False)
+        holder.is_result = True
+        holder.fn = holder.label_text = None
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                      margin_top=2, margin_bottom=12,
+                      margin_start=12, margin_end=12)
+
+        if isinstance(body, Panel):
+            # The action builds its own widget - a dropdown, a live label -
+            # and fills in its text later, so Copy has to ask it each time
+            # rather than capture a string now.
+            widget = body.build(self)
+            widget.add_css_class("qm-text")
+            box.append(widget)
+            get_text = body.current_text
+            self._result_label = body.label_widget()
+        else:
+            label = Gtk.Label(label=body, selectable=True, wrap=True,
+                              xalign=0.0, halign=Gtk.Align.START,
+                              # 70 only so a 64-character sha256 fits
+                              # on one line; shorter results never
+                              # widen the window at all.
+                              max_width_chars=70 if mono else 46)
+            # A 128-character hex digest is one unbreakable word, so plain
+            # word wrapping cannot split it and the label demands its full
+            # width - which stretched the window past 1000px. WORD_CHAR
+            # lets it break inside the token. Short lines, including the
+            # 2-D maths blocks, never reach the limit so stay untouched.
+            label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
+            label.add_css_class("qm-mono" if mono else "qm-text")
+            box.append(label)
+            get_text = lambda: body               # noqa: E731
+            self._result_label = label
+            self._last_result = body
+            set_clipboard(body)         # usually the next step is pasting it
+
+        self._get_text = get_text
+        buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                          halign=Gtk.Align.START)
+        copy_btn = Gtk.Button(label="Copy")
+        copy_btn.connect(
+            "clicked", lambda *_: self._copy_feedback(copy_btn,
+                                                      self._pick_text()))
+        buttons.append(copy_btn)
+        if YDOTOOL:
+            rep = Gtk.Button(label="Replace selection")
+            rep.set_tooltip_text(
+                "Paste this over the text you highlighted   (Ctrl+Enter)")
+            rep.connect("clicked",
+                        lambda *_: self.replace_selection(self._pick_text()))
+            buttons.append(rep)
+        box.append(buttons)
+
+        holder.set_child(box)
+        self.list.insert(holder, index + 1)
+        self._result_row = holder
+
+    def note_text(self, text):
+        """A panel reporting the text it now holds, so Esc does not lose it."""
+        if text:
+            self._last_result = text
+            set_clipboard(text)
+
+    def _copy_feedback(self, btn, body):
+        set_clipboard(body)
+        self._last_result = body
+        btn.set_label("Copied")
+        GLib.timeout_add_seconds(
+            2, lambda: (btn.set_label("Copy"), False)[1])
+
+
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="dev.sebastian.qm")
+
+    def do_startup(self):
+        Gtk.Application.do_startup(self)
+        css = Gtk.CssProvider()
+        css.load_from_data(_CSS)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), css,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def do_activate(self):
+        """Open the menu, or dismiss it if it is already up.
+
+        Every press launches a fresh process; GtkApplication turns that into
+        a toggle for free, because a second process with the same
+        application_id hands its activation to the running one and exits.
+        Closing the last window quits, so the next press re-reads the
+        selection - which is what you want, it has probably changed.
+        """
+        if self.get_windows():
+            for w in list(self.get_windows()):
+                w.close()
+            return
+        Menu(self, selection()).present()
+
+
+if __name__ == "__main__":
+    sys.exit(App().run([]))
