@@ -1,5 +1,5 @@
 [Unit]
-Description=ydotoold (user) - input synthesis for qm's "Replace selection"
+Description=ydotoold (user) - input synthesis for Lightning Menu's "Replace selection"
 
 [Service]
 # Runs as the user, not root: logind puts an ACL on /dev/uinput for the

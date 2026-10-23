@@ -1,4 +1,4 @@
-// Put the qm menu at the mouse pointer.
+// Put the lm menu at the mouse pointer.
 //
 // This exists because nothing outside the compositor can do it. On Wayland a
 // client may not place its own surface, and there is no protocol to ask where
@@ -11,16 +11,16 @@
 // real position, and Mutter can move any window, Wayland clients included.
 //
 // No UI, no timers, no signal handlers: one D-Bus method that runs only when
-// qm calls it.
+// lm calls it.
 
 import Gio from 'gi://Gio';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const PATH = '/org/gnome/Shell/Extensions/QmPlace';
+const PATH = '/org/gnome/Shell/Extensions/LmPlace';
 
 const IFACE = `
 <node>
-  <interface name="org.gnome.Shell.Extensions.QmPlace">
+  <interface name="org.gnome.Shell.Extensions.LmPlace">
     <method name="PlaceAtPointer">
       <arg type="s" direction="in"  name="title"/>
       <arg type="i" direction="in"  name="gap"/>
@@ -72,7 +72,7 @@ class Service {
     }
 }
 
-export default class QmPlaceExtension extends Extension {
+export default class LmPlaceExtension extends Extension {
     enable() {
         this._service = new Service();
         this._dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this._service);

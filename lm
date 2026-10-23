@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""qm - a popup menu that acts on whatever text is currently highlighted.
+"""lm - a popup menu that acts on whatever text is currently highlighted.
 
 Bound to a key or a remapped mouse button. Press to open, press again (or
 click elsewhere, or Esc) to dismiss. Results appear inline underneath the
@@ -35,7 +35,7 @@ YDOTOOL = shutil.which("ydotool")
 XDOTOOL = shutil.which("xdotool")
 # Distinctive, so xdotool can find this window and nothing else. Never seen:
 # the window is undecorated.
-QM_TITLE = "qm-selection-menu"
+LM_TITLE = "lm-selection-menu"
 # evdev keycodes - what ydotool speaks. KEY_LEFTCTRL / KEY_V.
 _K_CTRL, _K_V, _K_A, _K_INS = 29, 47, 30, 110
 # ydotoold runs as this user (logind grants an ACL on /dev/uinput), so its
@@ -63,7 +63,7 @@ def selection():
 
 
 LOG = os.path.join(os.environ.get(
-    "XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "qm.log")
+    "XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "lm.log")
 
 
 def note(line):
@@ -91,11 +91,11 @@ def _on_x11():
 
 
 PLACE_FILE = os.path.join(os.environ.get(
-    "XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "qm-place")
+    "XDG_CACHE_HOME", os.path.expanduser("~/.cache")), "lm-place")
 
 
 def shell_place_at_pointer(title, gap=14):
-    """Ask the qmplace shell extension to put this window at the pointer.
+    """Ask the lmplace shell extension to put this window at the pointer.
 
     The compositor is the only place where this is possible at all: a client
     may not position its own surface on Wayland, and cannot learn where the
@@ -111,8 +111,8 @@ def shell_place_at_pointer(title, gap=14):
     try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         placed, = bus.call_sync(
-            "org.gnome.Shell", "/org/gnome/Shell/Extensions/QmPlace",
-            "org.gnome.Shell.Extensions.QmPlace", "PlaceAtPointer",
+            "org.gnome.Shell", "/org/gnome/Shell/Extensions/LmPlace",
+            "org.gnome.Shell.Extensions.LmPlace", "PlaceAtPointer",
             GLib.Variant("(si)", (title, gap)),
             GLib.VariantType("(b)"), Gio.DBusCallFlags.NONE, 2000,
             None).unpack()
@@ -202,9 +202,9 @@ def set_clipboard(text):
         pass
 
 
-def notify(body, summary="qm"):
+def notify(body, summary="lm"):
     try:
-        subprocess.Popen(["notify-send", "-a", "qm", summary, body])
+        subprocess.Popen(["notify-send", "-a", "lm", summary, body])
     except OSError:
         pass
 
@@ -2359,17 +2359,34 @@ _MONO_ACTIONS = {act_calc, act_bases, act_json, act_case, act_time,
 
 
 # ----------------------------------------------------------------------- ui
+# Yellow is GNOME's own yellow-4, which keeps enough contrast against both
+# the light and the dark theme; the accent is only ever used at low alpha or
+# as a hairline, so it never fights the text it sits behind.
 _CSS = b"""
-.qm-mono   { font-family: monospace; font-size: 0.95em; }
-.qm-text   { font-size: 1.0em; }
-.qm-head   { font-size: 0.9em; }
-.qm-panel  { border: 1px solid alpha(currentColor, 0.18); }
+@define-color lm_accent #e5a50a;
+
+.lm-mono   { font-family: monospace; font-size: 0.95em; }
+.lm-text   { font-size: 1.0em; }
+.lm-head   { font-size: 0.9em; }
+
+.lm-panel {
+  border: 1px solid alpha(@lm_accent, 0.45);
+  border-top: 3px solid @lm_accent;
+}
+
+/* The bolt: a short mark down the left of whatever is focused. */
+.lm-list > row:hover      { background: alpha(@lm_accent, 0.12); }
+.lm-list > row:selected   { background: alpha(@lm_accent, 0.20); }
+.lm-list > row:selected   { box-shadow: inset 3px 0 0 0 @lm_accent; }
+.lm-list > row:selected label { font-weight: 600; }
+
+.lm-accent { color: @lm_accent; }
 """
 
 
 class Menu(Gtk.ApplicationWindow):
     def __init__(self, app, text):
-        super().__init__(application=app, title=QM_TITLE)
+        super().__init__(application=app, title=LM_TITLE)
         self.text = text
         self._result_row = None
         # Deliberately narrow. max-width-chars below is a wrap limit,
@@ -2378,7 +2395,7 @@ class Menu(Gtk.ApplicationWindow):
         self.set_default_size(380, -1)
         self.set_resizable(False)
         self.set_decorated(False)          # no titlebar
-        self.add_css_class("qm-panel")
+        self.add_css_class("lm-panel")
 
         # Dismiss on focus loss, like a context menu.
         #
@@ -2412,7 +2429,7 @@ class Menu(Gtk.ApplicationWindow):
             halign=Gtk.Align.START, wrap=True, max_width_chars=40,
             margin_top=10, margin_bottom=8, margin_start=12, margin_end=12)
         head.add_css_class("dim-label")
-        head.add_css_class("qm-head")
+        head.add_css_class("lm-head")
 
         # With no titlebar there is nothing to grab, so the header text is the
         # drag handle. A WindowHandle forwards a press-and-drag on its child
@@ -2431,6 +2448,7 @@ class Menu(Gtk.ApplicationWindow):
         root.append(self.filter)
 
         self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.list.add_css_class("lm-list")
         self.list.set_filter_func(self._matches)
         self.list.connect("row-activated", self._chosen)
         # One flat list, in ACTIONS order. A split by "does it read the
@@ -2459,7 +2477,7 @@ class Menu(Gtk.ApplicationWindow):
                 margin_top=6, margin_bottom=10,
                 margin_start=12, margin_end=12)
             footer.add_css_class("dim-label")
-            footer.add_css_class("qm-head")
+            footer.add_css_class("lm-head")
             root.append(footer)
             self.footer = footer
 
@@ -2502,7 +2520,7 @@ class Menu(Gtk.ApplicationWindow):
         if not (XDOTOOL and _on_x11()):
             return
         try:
-            found = subprocess.run([XDOTOOL, "search", "--name", QM_TITLE],
+            found = subprocess.run([XDOTOOL, "search", "--name", LM_TITLE],
                                    capture_output=True, text=True, timeout=3)
             ids = found.stdout.split()
             if not ids:
@@ -2623,7 +2641,7 @@ class Menu(Gtk.ApplicationWindow):
         first = self._place_tries == 1
 
         # The real answer: the shell extension knows where the pointer is.
-        placed = shell_place_at_pointer(QM_TITLE)
+        placed = shell_place_at_pointer(LM_TITLE)
         if placed:
             note(f"placed at the pointer by the extension "
                  f"(try {self._place_tries})")
@@ -2637,7 +2655,7 @@ class Menu(Gtk.ApplicationWindow):
         # Extension absent - fall back to wherever it was last dragged,
         # which needs X11 because that route goes through xdotool.
         if not (XDOTOOL and _on_x11()):
-            note("no placement: the qmplace extension is not loaded "
+            note("no placement: the lmplace extension is not loaded "
                  "(log out and back in) and this is not an X11 client")
             return False
         where = saved_place()
@@ -2646,7 +2664,7 @@ class Menu(Gtk.ApplicationWindow):
                  "drag the window and it will reopen there")
             return False
         try:
-            found = subprocess.run([XDOTOOL, "search", "--name", QM_TITLE],
+            found = subprocess.run([XDOTOOL, "search", "--name", LM_TITLE],
                                    capture_output=True, text=True, timeout=3)
             ids = found.stdout.split()
             if not ids:
@@ -2784,7 +2802,7 @@ class Menu(Gtk.ApplicationWindow):
             # and fills in its text later, so Copy has to ask it each time
             # rather than capture a string now.
             widget = body.build(self)
-            widget.add_css_class("qm-text")
+            widget.add_css_class("lm-text")
             box.append(widget)
             get_text = body.current_text
             self._result_label = body.label_widget()
@@ -2801,7 +2819,7 @@ class Menu(Gtk.ApplicationWindow):
             # lets it break inside the token. Short lines, including the
             # 2-D maths blocks, never reach the limit so stay untouched.
             label.set_wrap_mode(Pango.WrapMode.WORD_CHAR)
-            label.add_css_class("qm-mono" if mono else "qm-text")
+            label.add_css_class("lm-mono" if mono else "lm-text")
             box.append(label)
             get_text = lambda: body               # noqa: E731
             self._result_label = label
@@ -2845,7 +2863,7 @@ class Menu(Gtk.ApplicationWindow):
 
 class App(Gtk.Application):
     def __init__(self):
-        super().__init__(application_id="dev.sebastian.qm")
+        super().__init__(application_id="dev.sebastian.lm")
 
     def do_startup(self):
         Gtk.Application.do_startup(self)

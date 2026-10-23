@@ -1,14 +1,14 @@
 #!/bin/bash
-# Put qm where the system expects it, without copying anything: everything
+# Put lm where the system expects it, without copying anything: everything
 # is symlinked back to this repo so edits here are live.
 set -e
 HERE="$(cd "$(dirname "$0")" && pwd)"
-UUID="qmplace@sebastian"
+UUID="lmplace@sebastian"
 
 mkdir -p ~/.local/bin ~/.config/systemd/user \
          "$HOME/.local/share/gnome-shell/extensions/$UUID"
 
-ln -sfn "$HERE/qm" ~/.local/bin/qm
+ln -sfn "$HERE/lm" ~/.local/bin/lm
 ln -sfn "$HERE/bin/whatbutton" ~/.local/bin/whatbutton
 ln -sfn "$HERE/systemd/ydotoold.service" \
         ~/.config/systemd/user/ydotoold.service
@@ -30,7 +30,7 @@ echo "       gnome-extensions enable $UUID"
 echo
 echo "  2. bind a key:"
 echo "       Settings > Keyboard > Custom Shortcuts > +"
-echo "       command:  $HOME/.local/bin/qm"
+echo "       command:  $HOME/.local/bin/lm"
 echo
 echo "  3. optional, a mouse button: input-remapper-gtk,"
 echo "     map a spare button to the same combo"

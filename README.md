@@ -1,4 +1,4 @@
-# qm
+# lm
 
 A pop-up menu that acts on whatever text is highlighted, and a place to put
 desktop utilities. Bound to a key or a remapped mouse button: highlight
@@ -85,7 +85,7 @@ sudo apt install python3-sympy wl-clipboard translate-shell \
 ./install.sh
 ```
 
-That symlinks `qm` onto your PATH, installs the shell extension and the
+That symlinks `lm` onto your PATH, installs the shell extension and the
 `ydotoold` user service, and prints the remaining manual steps (the
 keybinding, and the mouse-button mapping if you want one).
 

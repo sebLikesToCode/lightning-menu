@@ -1,0 +1,7 @@
+{
+  "uuid": "lmplace@sebastian",
+  "name": "Lightning Menu placement",
+  "description": "Lets the lm selection menu open at the mouse pointer. Exposes one D-Bus method; adds nothing to the UI.",
+  "shell-version": ["50"],
+  "version": 1
+}
