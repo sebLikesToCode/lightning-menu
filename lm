@@ -2930,20 +2930,13 @@ class Menu(Gtk.ApplicationWindow):
 
 
 class App(Gtk.Application):
-    # Longer than the keyboard's repeat delay (500ms by default), because a
-    # held key fires one press and then one every 30ms - 51 toggles over two
-    # seconds, which flickers the window open and shut. The guard resets on
-    # every request, accepted or not, so holding the button can never
-    # accumulate a second toggle however long it is held.
-    #
-    # The cost is that a deliberate second press inside this window is
-    # ignored too; Esc and clicking away still dismiss instantly.
-    REPEAT_GUARD = float(os.environ.get("LM_REPEAT_GUARD", "0.6"))
-
     def __init__(self, resident=False):
         super().__init__(application_id="dev.sebastian.lm")
         self.resident = resident
         self._last_request = 0.0
+        self._holding = False
+        self._pending = None
+        self._repeat = self._repeat_timings()
 
     def do_startup(self):
         Gtk.Application.do_startup(self)
@@ -2983,23 +2976,77 @@ class App(Gtk.Application):
                     # Always acknowledge, even when the request is swallowed
                     # as auto-repeat: the client only needs to know a daemon
                     # answered, and must not fall back to starting its own.
-                    if self.accept_request():
-                        # The toolkit is not thread-safe; hop to the loop.
-                        GLib.idle_add(self.toggle)
+                    # All the deciding happens on the main loop, so the
+                    # timing state is only ever touched from one thread.
+                    GLib.idle_add(self.on_request)
                     conn.sendall(b"ok\n")
                 except OSError:
                     pass
 
-    def accept_request(self):
-        """True for a real press, False for keyboard auto-repeat.
+    @staticmethod
+    def _repeat_timings():
+        """The keyboard's own auto-repeat delay and interval, in seconds.
 
-        Thread-safe enough for this: the listener thread is the only caller,
-        and a stale read would at worst let one extra toggle through.
+        Read rather than assumed, so the detection below stays correct if
+        these are changed in Settings.
+        """
+        try:
+            conf = Gio.Settings.new("org.gnome.desktop.peripherals.keyboard")
+            return (conf.get_uint("delay") / 1000.0,
+                    conf.get_uint("repeat-interval") / 1000.0)
+        except Exception:
+            return 0.5, 0.03
+
+    def _cancel_pending(self):
+        if self._pending is not None:
+            GLib.source_remove(self._pending)
+            self._pending = None
+
+    def on_request(self):
+        """Decide whether a request is a real press or keyboard auto-repeat.
+
+        Holding the button produces one press and then one event every
+        repeat-interval (30ms by default) after one repeat-delay (500ms).
+        Nobody clicks at 30ms intervals, so that cadence is the giveaway and
+        anything arriving that fast is dropped - and once a burst is
+        recognised it stays recognised until things go quiet.
+
+        The one genuinely ambiguous event is the FIRST auto-repeat: arriving
+        one repeat-delay after the press, it looks exactly like a deliberate
+        second click. Only for a gap inside that narrow band do we wait a
+        few tens of milliseconds to see whether more follow at repeat
+        cadence. Every other press acts immediately, so deliberate fast
+        clicking is never slowed down.
         """
         now = time.monotonic()
         gap = now - self._last_request
-        self._last_request = now      # reset even when refusing
-        return gap >= self.REPEAT_GUARD
+        self._last_request = now
+        delay, interval = self._repeat
+        cadence = max(0.12, interval * 4)
+
+        if gap < cadence:                      # only auto-repeat is this fast
+            self._holding = True
+            self._cancel_pending()
+            return False
+        if self._holding and gap < 0.30:       # the tail of a burst
+            return False
+        self._holding = False
+
+        if delay - 0.10 <= gap <= delay + 0.15:
+            self._cancel_pending()
+            self._pending = GLib.timeout_add(
+                int((cadence + 0.02) * 1000), self._confirm_press, now)
+            return False
+
+        self.toggle()
+        return False
+
+    def _confirm_press(self, stamp):
+        """Act on a press that sat in the ambiguous band and was not a repeat."""
+        self._pending = None
+        if self._last_request == stamp and not self._holding:
+            self.toggle()
+        return False
 
     def toggle(self):
         """Open the menu, or dismiss it if it is already up.
