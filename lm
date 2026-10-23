@@ -2558,8 +2558,7 @@ class Menu(Gtk.ApplicationWindow):
         # yet, and its height is not final either - and the height decides
         # whether the menu goes above or below the pointer.
         self._place_tries = 0
-        self.connect("map",
-                     lambda *_: GLib.timeout_add(40, self._place_at_pointer))
+        self.connect("map", self._on_map)
 
     # -- behaviour
     def _active_changed(self, *_):
@@ -2694,6 +2693,83 @@ class Menu(Gtk.ApplicationWindow):
     def _after_paste(self):
         self.close()
         return False
+
+    def present(self, *args):
+        # Retype before the window is ever mapped, so the compositor never
+        # starts an animation to begin with.
+        if not self.get_realized():
+            self.realize()
+            self._suppress_animation()
+            # Mapped fully transparent: the window manager applies its own
+            # placement at map time and discards any position set before
+            # that, so the window genuinely does appear in the wrong place
+            # for a frame. It just must not be visible while it does.
+            self.set_opacity(0.0)
+        super().present(*args)
+
+    def _on_map(self, *_):
+        """Place the window, then reveal it."""
+        # Synchronous and using the XID we already hold, so there is no
+        # search and no wait - this happens within the same frame.
+        self._place_before_mapping()
+        GLib.idle_add(self._reveal)
+        # Whatever else happens, never leave the window invisible.
+        GLib.timeout_add(150, self._reveal)
+        GLib.timeout_add(40, self._place_at_pointer)
+        return False
+
+    def _reveal(self):
+        self.set_opacity(1.0)
+        return False
+
+    def _place_before_mapping(self):
+        """Put the window where it belongs before it is ever shown.
+
+        Placing it after the map was invisible while the compositor faded
+        the window in. Now that it appears instantly you would see it flash
+        at the default position and jump, so this happens first - the X
+        surface exists as soon as the window is realized, and can be moved
+        while still unmapped.
+
+        Only the remembered position; placing at the pointer needs the shell
+        extension, which cannot see the window until Mutter does.
+        """
+        where = saved_place()
+        surface = self.get_surface()
+        if (where is None or not XDOTOOL or surface is None
+                or not hasattr(surface, "get_xid")):
+            return
+        try:
+            subprocess.run(
+                [XDOTOOL, "windowmove", str(surface.get_xid()),
+                 str(where[0]), str(where[1])],
+                capture_output=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    def _suppress_animation(self):
+        """Ask the compositor not to fade this window in or out.
+
+        GNOME animates the map and unmap of windows it considers NORMAL or
+        DIALOG. A utility window is in neither list, so typing it that way
+        makes it appear and vanish instantly - which is what a menu should
+        do, and the fade was the whole complaint.
+
+        X11 only: _NET_WM_WINDOW_TYPE is an X11 property and GTK4 removed
+        the type-hint API, so under native Wayland the fade stays.
+        """
+        surface = self.get_surface()
+        if surface is None or not hasattr(surface, "get_xid"):
+            return
+        try:
+            subprocess.run(
+                ["xprop", "-id", str(surface.get_xid()),
+                 "-f", "_NET_WM_WINDOW_TYPE", "32a",
+                 "-set", "_NET_WM_WINDOW_TYPE",
+                 "_NET_WM_WINDOW_TYPE_UTILITY"],
+                capture_output=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
     def _place_at_pointer(self):
         """Move this window to the pointer, where that is possible at all.
