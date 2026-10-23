@@ -406,9 +406,49 @@ def _calculus(text):
     return text
 
 
+# AsciiMath - the plain-text maths notation MathJax and friends accept.
+# Most of it already parses; these are the tokens that did not, and several
+# were failing silently: "6 xx 7" came out as 42x because xx read as x*x.
+#
+# The calculus keywords are simply rewritten to the symbols the rules above
+# already understand, rather than given parallel rules of their own.
+_GREEK_WORDS = {
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ",
+    "epsilon": "ε", "zeta": "ζ", "eta": "η", "theta": "θ",
+    "iota": "ι", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν",
+    "xi": "ξ", "rho": "ρ", "sigma": "σ", "tau": "τ", "upsilon": "υ",
+    "phi": "φ", "chi": "χ", "psi": "ψ", "omega": "ω",
+    "Gamma": "Γ", "Delta": "Δ", "Theta": "Θ", "Lambda": "Λ",
+    "Phi": "Φ", "Psi": "Ψ", "Omega": "Ω",
+}
+# Sigma and Pi are deliberately absent: turning the words into Σ and ∏ would
+# make them read as a summation or a product.
+
+_ROOT_CALL = re.compile(r"\broot\s*\(([^()]*)\)\s*\(([^()]*)\)")
+
+
+def asciimath(src):
+    """Rewrite AsciiMath tokens into the forms everything else expects."""
+    s = _ROOT_CALL.sub(r"root(\2, \1)", src)
+    s = re.sub(r"\bxx\b", "*", s)          # 6 xx 7
+    s = s.replace("-:", "/")               # 6 -: 2
+    s = re.sub(r"\bceil\b", "ceiling", s)  # sympy spells it ceiling
+    # Greek spelled out. Also dodges sympy reading beta, gamma and zeta as
+    # the special functions of those names, and lambda as a Python keyword.
+    for word, letter in _GREEK_WORDS.items():
+        s = re.sub(rf"\b{word}\b", letter, s)
+    # Keywords onto the symbols the calculus rules already match.
+    # No trailing \b: underscore is a word character, so there is no word
+    # boundary in "sum_" and the obvious pattern silently never fires.
+    s = re.sub(r"\bsum(?=\s*_)", "∑", s)
+    s = re.sub(r"\bprod(?=\s*_)", "∏", s)
+    s = re.sub(r"\bint(?![A-Za-z0-9])", "∫", s)   # not "integrate"
+    return s
+
+
 def normalise_maths(src):
     """Rewrite typographic maths into something a parser accepts."""
-    s = src.strip()
+    s = asciimath(src.strip())
 
     for k, v in _VULGAR.items():
         s = s.replace(k, v)
@@ -470,10 +510,14 @@ def prettify_maths(text):
 
     # Integer powers become superscripts; anything else falls back to ^,
     # since there are no superscript glyphs for arbitrary expressions.
-    out = re.sub(r"\*\*\(?(-?\d+)\)?",
-                 lambda m: m.group(1).translate(_SUPER_OUT), out)
-    out = re.sub(r"\^\(?(-?\d+)\)?",
-                 lambda m: m.group(1).translate(_SUPER_OUT), out)
+    # Bracketed only when the bracket closes right after the digits:
+    # "2**(3+1)" must not have "**(3" lifted out of it, which left "2³+1)".
+    out = re.sub(r"\*\*\((-?\d+)\)|\*\*(-?\d+)",
+                 lambda m: (m.group(1) or m.group(2)).translate(_SUPER_OUT),
+                 out)
+    out = re.sub(r"\^\((-?\d+)\)|\^(-?\d+)",
+                 lambda m: (m.group(1) or m.group(2)).translate(_SUPER_OUT),
+                 out)
     out = out.replace("**", "^")
 
     out = re.sub(r"\bsqrt\((\d+(?:\.\d+)?)\)(?!\s*\*)",
